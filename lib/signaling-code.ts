@@ -74,9 +74,9 @@ export function createRoomId(): string {
 
 export function summarizeCode(code: string): string {
   const clean = code.trim();
-  if (clean.length <= 26) {
+  if (clean.length <= 50) {
     return clean;
   }
 
-  return `${clean.slice(0, 14)}...${clean.slice(-8)}`;
+  return `${clean.slice(0, 25)}...${clean.slice(-22)}`;
 }

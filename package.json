@@ -15,8 +15,10 @@
     "test:e2e": "bun run scripts/e2e-webrtc.ts",
     "test:e2e:chrome": "E2E_BROWSER=chromium bun run scripts/e2e-webrtc.ts",
     "test:e2e:chrome:shared-room": "E2E_BROWSER=chromium E2E_SHARED_ROOM=true bun run scripts/e2e-webrtc.ts",
+    "test:e2e:chrome:no-media": "E2E_BROWSER=chromium E2E_SKIP_MEDIA=true bun run scripts/e2e-webrtc.ts",
     "test:e2e:firefox": "E2E_BROWSER=firefox bun run scripts/e2e-webrtc.ts",
-    "test:e2e:all": "bun run test:e2e:chrome && bun run test:e2e:chrome:shared-room && bun run test:e2e:firefox"
+    "test:e2e:firefox:no-media": "E2E_BROWSER=firefox E2E_SKIP_MEDIA=true bun run scripts/e2e-webrtc.ts",
+    "test:e2e:all": "bun run test:e2e:chrome && bun run test:e2e:chrome:shared-room && bun run test:e2e:chrome:no-media && bun run test:e2e:firefox && bun run test:e2e:firefox:no-media"
   },
   "dependencies": {
     "lz-string": "^1.5.0",

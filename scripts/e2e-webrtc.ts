@@ -4,6 +4,7 @@ import { encodeSignal } from "../lib/signaling-code";
 const baseUrl = process.env.E2E_BASE_URL ?? "http://127.0.0.1:3000/";
 const browserName = process.env.E2E_BROWSER ?? "chromium";
 const sharedRoom = process.env.E2E_SHARED_ROOM === "true";
+const skipMedia = process.env.E2E_SKIP_MEDIA === "true";
 const chromePath = process.env.CHROME_PATH ?? "/usr/bin/google-chrome";
 const firefoxPath = process.env.FIREFOX_PATH;
 
@@ -78,15 +79,21 @@ async function main() {
   await alice.locator("#displayName").fill("Alice");
   await bob.locator("#displayName").fill("Bob");
 
-  await alice.getByRole("button", { name: /Включить медиа/ }).click();
-  await bob.getByRole("button", { name: /Включить медиа/ }).click();
-  await expect(alice.getByText("медиа готово")).toBeVisible({ timeout: 10_000 });
-  await expect(bob.getByText("медиа готово")).toBeVisible({ timeout: 10_000 });
+  if (!skipMedia) {
+    await alice.getByRole("button", { name: /Включить медиа/ }).click();
+    await bob.getByRole("button", { name: /Включить медиа/ }).click();
+    await expect(alice.getByText("медиа готово")).toBeVisible({ timeout: 10_000 });
+    await expect(bob.getByText("медиа готово")).toBeVisible({ timeout: 10_000 });
+  }
 
   await alice.getByRole("button", { name: /Создать offer/ }).click();
   const aliceOut = alice.locator('textarea[id^="out-"]');
   await expect(aliceOut).toHaveValue(/^manual-meet-v1\./, { timeout: 20_000 });
   const offer = await aliceOut.inputValue();
+  const offerPreview = await alice
+    .locator('input[placeholder="Короткое превью, 50 символов"]')
+    .inputValue();
+  expect(offerPreview.length).toBeLessThanOrEqual(50);
 
   const malformedOffer = encodeSignal({
     version: 1,
@@ -130,7 +137,7 @@ async function main() {
   await alice.getByRole("button", { name: /Отправить/ }).click();
   await expect(bob.getByText("ping from Alice")).toBeVisible({ timeout: 10_000 });
 
-  if (browserName === "chromium") {
+  if (browserName === "chromium" && !skipMedia) {
     await alice.getByTitle("Показать экран").click();
     await expect(alice.getByTitle("Остановить демонстрацию")).toBeVisible({
       timeout: 10_000
@@ -152,7 +159,7 @@ async function main() {
 
   await browser.close();
   console.log(
-    `E2E WebRTC smoke test passed in ${browserName} (${sharedRoom ? "shared room" : "offer adopts room"}).`
+    `E2E WebRTC smoke test passed in ${browserName} (${sharedRoom ? "shared room" : "offer adopts room"}${skipMedia ? ", no media" : ""}).`
   );
 }
 

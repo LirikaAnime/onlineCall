@@ -526,10 +526,6 @@ export function MeetApp() {
   const createOffer = useCallback(
     async (peerId: string) => {
       try {
-        if (!localStreamRef.current) {
-          throw new Error("Сначала включите камеру и микрофон.");
-        }
-
         closeRuntime(peerId);
         patchPeer(peerId, {
           status: "preparing",
@@ -594,10 +590,6 @@ export function MeetApp() {
       }
 
       try {
-        if (!localStreamRef.current) {
-          throw new Error("Сначала включите камеру и микрофон.");
-        }
-
         const signal = decodeSignal(peer.incomingCode);
         const currentRoomId = roomIdRef.current;
         const expectedRoomId = peer.sessionRoomId || currentRoomId;
@@ -995,8 +987,8 @@ export function MeetApp() {
                 </button>
               </div>
               <p className="helper">
-                Ссылка открывает ту же комнату, но не заменяет обмен кодами: GitHub Pages не
-                умеет пересылать signaling автоматически.
+                Ссылка открывает ту же комнату, но не заменяет обмен кодами. Камера и микрофон
+                необязательны: можно подключиться как слушатель или только для чата.
               </p>
             </section>
 
@@ -1073,7 +1065,8 @@ export function MeetApp() {
                 <div>
                   <strong>Без сервера работает честно, но вручную.</strong>
                   Для каждого собеседника нужно обменяться offer/answer кодами через любой личный
-                  канал: Telegram, почту, мессенджер или QR с другого приложения.
+                  канал. Короткий код в карточке - это 50-символьное превью; для подключения нужен
+                  полный код, потому что в нем лежат WebRTC-параметры.
                 </div>
               </div>
             </section>
@@ -1161,7 +1154,6 @@ export function MeetApp() {
                 type="button"
                 title={isSharingScreen ? "Остановить демонстрацию" : "Показать экран"}
                 onClick={isSharingScreen ? stopScreenShare : startScreenShare}
-                disabled={!hasLocalMedia}
               >
                 {isSharingScreen ? <ScreenShareOff size={21} /> : <MonitorUp size={21} />}
               </button>
@@ -1192,7 +1184,6 @@ export function MeetApp() {
                     key={peer.id}
                     peer={peer}
                     index={index}
-                    disabled={!hasLocalMedia}
                     onCreateOffer={createOffer}
                     onApplySignal={applySignal}
                     onPatch={patchPeer}
@@ -1260,7 +1251,6 @@ export function MeetApp() {
 function PeerCard({
   peer,
   index,
-  disabled,
   onCreateOffer,
   onApplySignal,
   onPatch,
@@ -1269,7 +1259,6 @@ function PeerCard({
 }: {
   peer: PeerRecord;
   index: number;
-  disabled: boolean;
   onCreateOffer: (peerId: string) => Promise<void>;
   onApplySignal: (peerId: string) => Promise<void>;
   onPatch: (peerId: string, patch: Partial<PeerRecord>) => void;
@@ -1298,7 +1287,7 @@ function PeerCard({
           <button
             className="btn btn-primary"
             type="button"
-            disabled={disabled || peer.status === "preparing" || peer.status === "connected"}
+            disabled={peer.status === "preparing" || peer.status === "connected"}
             onClick={() => onCreateOffer(peer.id)}
           >
             <Clipboard size={16} />
@@ -1324,7 +1313,7 @@ function PeerCard({
               className="input"
               value={peer.outgoingCode ? summarizeCode(peer.outgoingCode) : ""}
               readOnly
-              placeholder="Короткий вид кода"
+              placeholder="Короткое превью, 50 символов"
             />
             <button
               className="icon-btn"
@@ -1350,7 +1339,7 @@ function PeerCard({
           <button
             className="btn btn-secondary"
             type="button"
-            disabled={disabled || !peer.incomingCode.trim()}
+            disabled={!peer.incomingCode.trim()}
             onClick={() => onApplySignal(peer.id)}
           >
             <Check size={16} />
