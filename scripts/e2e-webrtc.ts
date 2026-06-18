@@ -95,7 +95,7 @@ async function main() {
   }
 
   const alice = await aliceContext.newPage();
-  await alice.goto(baseUrl);
+  await alice.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
   await waitForRoomReady(alice);
   await alice.locator("#displayName").fill("Alice");
   const roomCode = (await alice.locator(".room-code").innerText()).trim().toLowerCase();
@@ -104,9 +104,9 @@ async function main() {
   if (sharedRoom) {
     const bobUrl = new URL(baseUrl);
     bobUrl.searchParams.set("room", roomCode);
-    await bob.goto(bobUrl.toString());
+    await bob.goto(bobUrl.toString(), { waitUntil: "domcontentloaded", timeout: 45_000 });
   } else {
-    await bob.goto(baseUrl);
+    await bob.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
   }
   await waitForRoomReady(bob);
   await bob.locator("#displayName").fill("Bob");
