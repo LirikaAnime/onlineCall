@@ -1,7 +1,7 @@
 {
-  "name": "Manual Meet",
-  "short_name": "Meet",
-  "description": "Static WebRTC calls with manual signaling for GitHub Pages.",
+  "name": "OnlineCall",
+  "short_name": "OnlineCall",
+  "description": "Static WebRTC calls with short room codes for GitHub Pages.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

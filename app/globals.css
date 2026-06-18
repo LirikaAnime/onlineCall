@@ -317,6 +317,69 @@ video {
   margin-bottom: 2px;
 }
 
+.room-code {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 58px;
+  margin-bottom: 12px;
+  border: 1px solid #bed1cb;
+  border-radius: 8px;
+  background: #e9f5ef;
+  color: #0b5c49;
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 1.7rem;
+  font-weight: 850;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.connection-banner {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  margin-top: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: #34443f;
+  font-size: 0.84rem;
+  line-height: 1.35;
+}
+
+.connection-banner.ready {
+  border-color: #bce4d0;
+  background: #e6f8ef;
+  color: #0d684f;
+}
+
+.connection-banner.error {
+  border-color: #f1c7c2;
+  background: #fff1ef;
+  color: #9e2f26;
+}
+
+.connection-banner.reconnecting,
+.connection-banner.connecting,
+.connection-banner.booting {
+  border-color: #f1d29a;
+  background: #fff8eb;
+  color: #65410b;
+}
+
+.spin {
+  animation: spin 950ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .stage {
   display: grid;
   grid-template-rows: auto minmax(380px, 1fr) auto;
@@ -494,6 +557,18 @@ video {
 .peer-list {
   display: grid;
   gap: 10px;
+}
+
+.participant-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 58px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
 }
 
 .peer-card {

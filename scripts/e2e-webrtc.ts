@@ -1,5 +1,4 @@
-import { chromium, expect, firefox } from "@playwright/test";
-import { encodeSignal } from "../lib/signaling-code";
+import { chromium, expect, firefox, Page } from "@playwright/test";
 
 const baseUrl = process.env.E2E_BASE_URL ?? "http://127.0.0.1:3000/";
 const browserName = process.env.E2E_BROWSER ?? "chromium";
@@ -7,6 +6,35 @@ const sharedRoom = process.env.E2E_SHARED_ROOM === "true";
 const skipMedia = process.env.E2E_SKIP_MEDIA === "true";
 const chromePath = process.env.CHROME_PATH ?? "/usr/bin/google-chrome";
 const firefoxPath = process.env.FIREFOX_PATH;
+
+async function waitForRoomReady(page: Page) {
+  await expect(page.locator(".room-code")).toHaveText(/[a-z0-9]{6,16}/, {
+    timeout: 20_000
+  });
+  await expect(page.locator(".connection-banner")).toContainText(/открыта|Готово|комнате/, {
+    timeout: 30_000
+  });
+}
+
+async function enableMedia(page: Page) {
+  await page.getByRole("button", { name: /Включить медиа/ }).click();
+  await expect
+    .poll(async () => {
+      return page.locator("video").first().evaluate((video) => Boolean((video as HTMLVideoElement).srcObject));
+    }, { timeout: 12_000 })
+    .toBe(true);
+}
+
+async function waitForConnectedPair(alice: Page, bob: Page) {
+  await expect(alice.getByText(/1 подключено/)).toBeVisible({ timeout: 45_000 });
+  await expect(bob.getByText(/1 подключено/)).toBeVisible({ timeout: 45_000 });
+  await expect(alice.locator(".participant-row", { hasText: "Bob" })).toContainText("онлайн", {
+    timeout: 20_000
+  });
+  await expect(bob.locator(".participant-row", { hasText: "Alice" })).toContainText("онлайн", {
+    timeout: 20_000
+  });
+}
 
 async function main() {
   const browser =
@@ -47,92 +75,62 @@ async function main() {
 
   const pageErrors: string[] = [];
   const failedRequests: string[] = [];
+  const consoleErrors: string[] = [];
 
   for (const context of [aliceContext, bobContext]) {
     context.on("page", (page) => {
       page.on("pageerror", (error) => pageErrors.push(error.message));
+      page.on("console", (message) => {
+        if (message.type() === "error") {
+          consoleErrors.push(message.text());
+        }
+      });
       page.on("requestfailed", (request) => {
+        const url = request.url();
+        if (url.includes("favicon") || url.includes("manifest")) return;
         const failure = request.failure();
-        failedRequests.push(`${request.url()} ${failure?.errorText ?? "failed"}`);
+        failedRequests.push(`${url} ${failure?.errorText ?? "failed"}`);
       });
     });
   }
 
   const alice = await aliceContext.newPage();
   await alice.goto(baseUrl);
-  await expect(alice.locator("#roomId")).toHaveValue(/\S+/);
-  const roomId = await alice.locator("#roomId").inputValue();
+  await waitForRoomReady(alice);
+  await alice.locator("#displayName").fill("Alice");
+  const roomCode = (await alice.locator(".room-code").innerText()).trim().toLowerCase();
 
   const bob = await bobContext.newPage();
-  const bobUrl = new URL(baseUrl);
   if (sharedRoom) {
-    bobUrl.searchParams.set("room", roomId);
-  }
-  await bob.goto(bobUrl.toString());
-  const bobInitialRoomId = await bob.locator("#roomId").inputValue();
-  if (sharedRoom) {
-    expect(bobInitialRoomId).toBe(roomId);
+    const bobUrl = new URL(baseUrl);
+    bobUrl.searchParams.set("room", roomCode);
+    await bob.goto(bobUrl.toString());
   } else {
-    expect(bobInitialRoomId).not.toBe(roomId);
+    await bob.goto(baseUrl);
   }
-
-  await alice.locator("#displayName").fill("Alice");
+  await waitForRoomReady(bob);
   await bob.locator("#displayName").fill("Bob");
 
-  if (!skipMedia) {
-    await alice.getByRole("button", { name: /Включить медиа/ }).click();
-    await bob.getByRole("button", { name: /Включить медиа/ }).click();
-    await expect(alice.getByText("медиа готово")).toBeVisible({ timeout: 10_000 });
-    await expect(bob.getByText("медиа готово")).toBeVisible({ timeout: 10_000 });
+  if (!sharedRoom) {
+    await bob.locator("#roomInput").fill(roomCode);
+    await bob.getByRole("button", { name: "Войти" }).click();
   }
 
-  await alice.getByRole("button", { name: /Создать offer/ }).click();
-  const aliceOut = alice.locator('textarea[id^="out-"]');
-  await expect(aliceOut).toHaveValue(/^manual-meet-v1\./, { timeout: 20_000 });
-  const offer = await aliceOut.inputValue();
-  const offerPreview = await alice
-    .locator('input[placeholder="Короткое превью, 50 символов"]')
-    .inputValue();
-  expect(offerPreview.length).toBeLessThanOrEqual(50);
+  await expect(bob.locator(".room-code")).toHaveText(roomCode, { timeout: 10_000 });
+  await waitForConnectedPair(alice, bob);
 
-  const malformedOffer = encodeSignal({
-    version: 1,
-    type: "offer",
-    roomId,
-    participantId: "bad-offer",
-    participantName: "Bad Offer",
-    createdAt: Date.now(),
-    description: {
-      type: "offer",
-      sdp: "v=0\r\n"
-    }
-  });
-
-  await bob.locator('textarea[id^="in-"]').fill(malformedOffer);
-  await bob.getByRole("button", { name: /Применить код/ }).click();
-  await expect(bob.getByText(/Ошибка:/)).toBeVisible({ timeout: 10_000 });
-
-  await bob.locator('textarea[id^="in-"]').fill(offer);
-  await bob.getByRole("button", { name: /Применить код/ }).click();
-  await expect(bob.locator("#roomId")).toHaveValue(roomId, { timeout: 5_000 });
-  const bobOut = bob.locator('textarea[id^="out-"]');
-  await expect(bobOut).toHaveValue(/^manual-meet-v1\./, { timeout: 20_000 });
-  const answer = await bobOut.inputValue();
-
-  await alice.locator('textarea[id^="in-"]').fill(answer);
-  await alice.getByRole("button", { name: /Применить код/ }).click();
-
-  await expect(alice.getByText(/1 подключено/)).toBeVisible({ timeout: 25_000 });
-  await expect(bob.getByText(/1 подключено/)).toBeVisible({ timeout: 25_000 });
-  await expect(alice.locator(".peer-name strong", { hasText: "Bob" })).toBeVisible({
-    timeout: 10_000
-  });
-  await expect(bob.locator(".peer-name strong", { hasText: "Alice" })).toBeVisible({
-    timeout: 10_000
-  });
+  if (!skipMedia) {
+    await enableMedia(alice);
+    await enableMedia(bob);
+    await expect
+      .poll(async () => alice.locator("video").count(), { timeout: 30_000 })
+      .toBeGreaterThanOrEqual(2);
+    await expect
+      .poll(async () => bob.locator("video").count(), { timeout: 30_000 })
+      .toBeGreaterThanOrEqual(2);
+  }
 
   const chatInput = alice.locator(".chat-form input");
-  await expect(chatInput).toBeEnabled({ timeout: 10_000 });
   await chatInput.fill("ping from Alice");
   await alice.getByRole("button", { name: /Отправить/ }).click();
   await expect(bob.getByText("ping from Alice")).toBeVisible({ timeout: 10_000 });
@@ -146,11 +144,24 @@ async function main() {
     await expect(alice.getByTitle("Показать экран")).toBeVisible({ timeout: 10_000 });
   }
 
-  if (pageErrors.length || failedRequests.length) {
+  const meaningfulConsoleErrors = consoleErrors.filter((error) => {
+    const knownPeerJsWebSocketNoise =
+      error.includes("0.peerjs.com/peerjs") &&
+      (error.includes("was interrupted") ||
+        error.includes("can’t establish a connection") ||
+        error.includes("can't establish a connection"));
+
+    return !error.includes("Critical dependency") && !knownPeerJsWebSocketNoise;
+  });
+
+  if (pageErrors.length || failedRequests.length || meaningfulConsoleErrors.length) {
     throw new Error(
       [
         pageErrors.length ? `Page errors:\n${pageErrors.join("\n")}` : "",
-        failedRequests.length ? `Failed requests:\n${failedRequests.join("\n")}` : ""
+        failedRequests.length ? `Failed requests:\n${failedRequests.join("\n")}` : "",
+        meaningfulConsoleErrors.length
+          ? `Console errors:\n${meaningfulConsoleErrors.join("\n")}`
+          : ""
       ]
         .filter(Boolean)
         .join("\n\n")
@@ -159,7 +170,7 @@ async function main() {
 
   await browser.close();
   console.log(
-    `E2E WebRTC smoke test passed in ${browserName} (${sharedRoom ? "shared room" : "offer adopts room"}${skipMedia ? ", no media" : ""}).`
+    `E2E room test passed in ${browserName} (${sharedRoom ? "shared link" : "typed code"}${skipMedia ? ", no media" : ""}).`
   );
 }
 

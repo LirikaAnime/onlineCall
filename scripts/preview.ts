@@ -43,6 +43,17 @@ async function resolveFile(request: Request) {
     return direct;
   }
 
+  const [, firstSegment, ...restSegments] = normalized.split("/");
+  if (firstSegment && restSegments.length) {
+    const withoutBasePath = join(root, restSegments.join("/"));
+    if (isInsideRoot(withoutBasePath)) {
+      const basePathFile = await existingFile(withoutBasePath);
+      if (basePathFile) {
+        return basePathFile;
+      }
+    }
+  }
+
   const index = await existingFile(join(candidate, "index.html"));
   if (index) {
     return index;

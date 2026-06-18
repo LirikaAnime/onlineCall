@@ -1,4 +1,4 @@
-const CACHE_NAME = "manual-meet-v1";
+const CACHE_NAME = "online-call-v2";
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
