@@ -4,6 +4,7 @@ const baseUrl = process.env.E2E_BASE_URL ?? "http://127.0.0.1:3000/";
 const browserName = process.env.E2E_BROWSER ?? "chromium";
 const sharedRoom = process.env.E2E_SHARED_ROOM === "true";
 const skipMedia = process.env.E2E_SKIP_MEDIA === "true";
+const blockPeerJs = process.env.E2E_BLOCK_PEERJS === "true";
 const chromePath = process.env.CHROME_PATH ?? "/usr/bin/google-chrome";
 const firefoxPath = process.env.FIREFOX_PATH;
 
@@ -56,6 +57,7 @@ async function main() {
             "--auto-select-desktop-capture-source=Entire screen",
             "--disable-dev-shm-usage",
             "--enable-usermedia-screen-capturing",
+            ...(blockPeerJs ? ["--host-resolver-rules=MAP 0.peerjs.com 127.0.0.1"] : []),
             "--no-sandbox",
             "--use-fake-device-for-media-stream",
             "--use-fake-ui-for-media-stream"

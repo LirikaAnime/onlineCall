@@ -26,10 +26,18 @@ import {
 } from "lucide-react";
 import type { DataConnection, MediaConnection, Peer } from "peerjs";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getTrackLabel, stopStream } from "@/lib/webrtc";
+import {
+  attachLocalMedia,
+  createRtcConfig,
+  getTrackLabel,
+  PeerWiring,
+  replaceSenderTrack,
+  stopStream
+} from "@/lib/webrtc";
 
 type Role = "host" | "guest";
 type Status = "booting" | "connecting" | "ready" | "reconnecting" | "error";
+type Transport = "local" | "peerjs";
 
 type Participant = {
   peerId: string;
@@ -90,6 +98,45 @@ type WireMessage =
       time: number;
       roomCode: string;
     };
+
+type LocalSignalMessage =
+  | {
+      type: "joined";
+      roomCode: string;
+      peers: RoomPeer[];
+    }
+  | {
+      type: "peer-joined";
+      roomCode: string;
+      peer: RoomPeer;
+    }
+  | {
+      type: "peer-left";
+      roomCode: string;
+      peerId: string;
+    }
+  | {
+      type: "signal";
+      roomCode: string;
+      fromPeerId: string;
+      peer: RoomPeer;
+      signal:
+        | { kind: "description"; description: RTCSessionDescriptionInit }
+        | { kind: "candidate"; candidate: RTCIceCandidateInit };
+    }
+  | {
+      type: "chat";
+      id: string;
+      author: string;
+      text: string;
+      time: number;
+      roomCode: string;
+    };
+
+type LocalPeerRuntime = {
+  connection: RTCPeerConnection;
+  wiring: PeerWiring;
+};
 
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const ROOM_PARAM = "room";
@@ -200,7 +247,10 @@ export function MeetApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [toast, setToast] = useState("");
 
+  const transportRef = useRef<Transport | null>(null);
   const peerRef = useRef<Peer | null>(null);
+  const localSocketRef = useRef<WebSocket | null>(null);
+  const localPeersRef = useRef(new Map<string, LocalPeerRuntime>());
   const connectionsRef = useRef(new Map<string, DataConnection>());
   const mediaCallsRef = useRef(new Map<string, MediaConnection>());
   const participantsRef = useRef(participants);
@@ -346,6 +396,18 @@ export function MeetApp() {
     [setRemoteStream]
   );
 
+  const closeLocalPeer = useCallback(
+    (peerId: string) => {
+      const runtime = localPeersRef.current.get(peerId);
+      if (runtime) {
+        runtime.connection.close();
+      }
+      localPeersRef.current.delete(peerId);
+      setRemoteStream(peerId, null);
+    },
+    [setRemoteStream]
+  );
+
   const closeDataConnection = useCallback(
     (peerId: string) => {
       const connection = connectionsRef.current.get(peerId);
@@ -355,9 +417,10 @@ export function MeetApp() {
       }
       connectionsRef.current.delete(peerId);
       closeMediaCall(peerId);
+      closeLocalPeer(peerId);
       removeParticipant(peerId);
     },
-    [closeMediaCall, removeParticipant]
+    [closeLocalPeer, closeMediaCall, removeParticipant]
   );
 
   const cleanupPeer = useCallback(() => {
@@ -385,6 +448,14 @@ export function MeetApp() {
       call.close();
     });
     mediaCallsRef.current.clear();
+
+    localSocketRef.current?.close();
+    localSocketRef.current = null;
+    localPeersRef.current.forEach((runtime, peerId) => {
+      runtime.connection.close();
+    });
+    localPeersRef.current.clear();
+    transportRef.current = null;
 
     peerRef.current?.removeAllListeners();
     peerRef.current?.destroy();
@@ -431,8 +502,267 @@ export function MeetApp() {
     return screenStreamRef.current ?? localStreamRef.current;
   }, []);
 
+  const sendLocalSignal = useCallback((message: Record<string, unknown>) => {
+    const socket = localSocketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message));
+    }
+  }, []);
+
+  const updateLocalMediaTracks = useCallback(() => {
+    const stream = activeSendStream();
+    const audioTrack = stream?.getAudioTracks()[0] ?? null;
+    const videoTrack = stream?.getVideoTracks()[0] ?? null;
+
+    localPeersRef.current.forEach((runtime, peerId) => {
+      void replaceSenderTrack(runtime.wiring.audioSender, audioTrack);
+      void replaceSenderTrack(runtime.wiring.videoSender, videoTrack);
+      void runtime.connection
+        .createOffer()
+        .then((description) => runtime.connection.setLocalDescription(description))
+        .then(() => {
+          if (!runtime.connection.localDescription) return;
+          sendLocalSignal({
+            type: "signal",
+            roomCode: roomCodeRef.current,
+            toPeerId: peerId,
+            signal: {
+              kind: "description",
+              description: runtime.connection.localDescription.toJSON()
+            }
+          });
+        });
+    });
+  }, [activeSendStream, sendLocalSignal]);
+
+  const localSignalUrl = useCallback(() => {
+    if (typeof window === "undefined") return null;
+    if (window.location.hostname.endsWith("github.io")) return null;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}${basePath}/ws`;
+  }, []);
+
+  const createLocalPeerConnection = useCallback(
+    (remotePeer: RoomPeer, shouldOffer: boolean) => {
+      if (!remotePeer.peerId || remotePeer.peerId === selfPeerIdRef.current) return null;
+
+      const existing = localPeersRef.current.get(remotePeer.peerId);
+      if (existing) {
+        setParticipant(remotePeer, { connected: true });
+        return existing;
+      }
+
+      const connection = new RTCPeerConnection(createRtcConfig("public-stun"));
+      const wiring = attachLocalMedia(connection, activeSendStream());
+      const runtime: LocalPeerRuntime = { connection, wiring };
+      localPeersRef.current.set(remotePeer.peerId, runtime);
+      setParticipant(remotePeer, { connected: true });
+
+      connection.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        sendLocalSignal({
+          type: "signal",
+          roomCode: roomCodeRef.current,
+          toPeerId: remotePeer.peerId,
+          signal: {
+            kind: "candidate",
+            candidate: event.candidate.toJSON()
+          }
+        });
+      };
+
+      connection.ontrack = (event) => {
+        const [stream] = event.streams;
+        setRemoteStream(remotePeer.peerId, stream ?? new MediaStream([event.track]));
+      };
+
+      connection.onconnectionstatechange = () => {
+        if (connection.connectionState === "connected") {
+          setParticipant(remotePeer, { connected: true });
+          return;
+        }
+
+        if (
+          connection.connectionState === "failed" ||
+          connection.connectionState === "closed" ||
+          connection.connectionState === "disconnected"
+        ) {
+          setParticipants((current) =>
+            current.map((participant) =>
+              participant.peerId === remotePeer.peerId
+                ? { ...participant, connected: false, remoteStream: null }
+                : participant
+            )
+          );
+        }
+      };
+
+      if (shouldOffer) {
+        void connection
+          .createOffer()
+          .then((description) => connection.setLocalDescription(description))
+          .then(() => {
+            if (!connection.localDescription) return;
+            sendLocalSignal({
+              type: "signal",
+              roomCode: roomCodeRef.current,
+              toPeerId: remotePeer.peerId,
+              signal: {
+                kind: "description",
+                description: connection.localDescription.toJSON()
+              }
+            });
+          });
+      }
+
+      return runtime;
+    },
+    [activeSendStream, sendLocalSignal, setParticipant, setRemoteStream]
+  );
+
+  const handleLocalSignalMessage = useCallback(
+    async (message: LocalSignalMessage) => {
+      if (message.roomCode !== roomCodeRef.current) return;
+
+      if (message.type === "joined") {
+        transportRef.current = "local";
+        setStatus("ready");
+        setStatusDetail(roleRef.current === "host" ? "Локальная комната открыта" : "Вы в локальной комнате");
+
+        for (const peer of message.peers) {
+          setParticipant(peer, { connected: true });
+        }
+        return;
+      }
+
+      if (message.type === "peer-joined") {
+        setParticipant(message.peer, { connected: true });
+        createLocalPeerConnection(message.peer, true);
+        return;
+      }
+
+      if (message.type === "peer-left") {
+        closeLocalPeer(message.peerId);
+        removeParticipant(message.peerId);
+        return;
+      }
+
+      if (message.type === "chat") {
+        setMessages((current) => {
+          if (current.some((item) => item.id === message.id)) return current;
+          return [
+            ...current,
+            {
+              id: message.id,
+              author: message.author,
+              text: message.text,
+              time: message.time
+            }
+          ];
+        });
+        return;
+      }
+
+      if (message.type !== "signal") return;
+
+      const runtime =
+        localPeersRef.current.get(message.fromPeerId) ??
+        createLocalPeerConnection(message.peer, false);
+      if (!runtime) return;
+
+      if (message.signal.kind === "description") {
+        await runtime.connection.setRemoteDescription(message.signal.description);
+        if (message.signal.description.type === "offer") {
+          const answer = await runtime.connection.createAnswer();
+          await runtime.connection.setLocalDescription(answer);
+          if (runtime.connection.localDescription) {
+            sendLocalSignal({
+              type: "signal",
+              roomCode: roomCodeRef.current,
+              toPeerId: message.fromPeerId,
+              signal: {
+                kind: "description",
+                description: runtime.connection.localDescription.toJSON()
+              }
+            });
+          }
+        }
+        return;
+      }
+
+      await runtime.connection.addIceCandidate(message.signal.candidate);
+    },
+    [closeLocalPeer, createLocalPeerConnection, removeParticipant, sendLocalSignal, setParticipant]
+  );
+
+  const startLocalSignaling = useCallback(
+    (nextRoomCode: string) => {
+      const url = localSignalUrl();
+      if (!url) return Promise.resolve(false);
+
+      return new Promise<boolean>((resolve) => {
+        let settled = false;
+        const socket = new WebSocket(url);
+        const timeout = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          socket.close();
+          resolve(false);
+        }, 1400);
+
+        socket.onopen = () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timeout);
+          localSocketRef.current = socket;
+          transportRef.current = "local";
+          setStatus("ready");
+          setStatusDetail(roleRef.current === "host" ? "Локальная комната открыта" : "Локальный signaling готов");
+          socket.send(
+            JSON.stringify({
+              type: "join",
+              roomCode: nextRoomCode,
+              peer: selfPeer()
+            })
+          );
+          resolve(true);
+        };
+
+        socket.onmessage = (event) => {
+          try {
+            void handleLocalSignalMessage(JSON.parse(event.data) as LocalSignalMessage);
+          } catch {
+            addSystemMessage("Локальный signaling прислал некорректное сообщение.");
+          }
+        };
+
+        socket.onclose = () => {
+          if (localSocketRef.current === socket) {
+            localSocketRef.current = null;
+          }
+
+          if (transportRef.current === "local") {
+            setStatus("reconnecting");
+            setStatusDetail("Локальный signaling отключился. Нажмите Повтор или перезапустите сервер.");
+          }
+        };
+
+        socket.onerror = () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timeout);
+          socket.close();
+          resolve(false);
+        };
+      });
+    },
+    [addSystemMessage, handleLocalSignalMessage, localSignalUrl, selfPeer]
+  );
+
   const callPeer = useCallback(
     (peerId: string) => {
+      if (transportRef.current === "local") return;
+
       const peer = peerRef.current;
       const stream = activeSendStream();
       if (!peer || !stream || !stream.getTracks().length || peerId === selfPeerIdRef.current) {
@@ -452,10 +782,15 @@ export function MeetApp() {
   );
 
   const callAllPeers = useCallback(() => {
+    if (transportRef.current === "local") {
+      updateLocalMediaTracks();
+      return;
+    }
+
     connectionsRef.current.forEach((connection, peerId) => {
       if (connection.open) callPeer(peerId);
     });
-  }, [callPeer]);
+  }, [callPeer, updateLocalMediaTracks]);
 
   const handleWireMessage = useCallback(
     (fromPeerId: string, message: WireMessage) => {
@@ -633,7 +968,6 @@ export function MeetApp() {
     async (nextRoomCode: string, nextRole: Role, attempt = 0) => {
       cleanupPeer();
 
-      const { Peer } = await import("peerjs");
       const nextPeerId =
         nextRole === "host"
           ? hostPeerId(nextRoomCode)
@@ -648,6 +982,12 @@ export function MeetApp() {
       roleRef.current = nextRole;
       selfPeerIdRef.current = nextPeerId;
 
+      if (await startLocalSignaling(nextRoomCode)) {
+        return;
+      }
+
+      transportRef.current = "peerjs";
+      const { Peer } = await import("peerjs");
       const peer = new Peer(nextPeerId, peerOptions);
       peerRef.current = peer;
 
@@ -783,6 +1123,7 @@ export function MeetApp() {
       connectToHost,
       participantId,
       setParticipant,
+      startLocalSignaling,
       updateRoomUrl,
       wireDataConnection,
       wireMediaCall
@@ -842,6 +1183,44 @@ export function MeetApp() {
       showToast(message);
     },
     [showToast]
+  );
+
+  const publishProfile = useCallback(() => {
+    if (!selfPeerIdRef.current || !roomCodeRef.current) return;
+
+    if (transportRef.current === "local") {
+      sendLocalSignal({
+        type: "profile",
+        roomCode: roomCodeRef.current,
+        peer: selfPeer()
+      });
+      return;
+    }
+
+    if (transportRef.current === "peerjs") {
+      broadcast({
+        type: "peer-joined",
+        peer: selfPeer(),
+        roomCode: roomCodeRef.current
+      });
+    }
+  }, [broadcast, selfPeer, sendLocalSignal]);
+
+  const publishProfileBurst = useCallback(() => {
+    publishProfile();
+    window.setTimeout(publishProfile, 250);
+    window.setTimeout(publishProfile, 1000);
+    window.setTimeout(publishProfile, 2500);
+  }, [publishProfile]);
+
+  const updateDisplayName = useCallback(
+    (nextName: string) => {
+      displayNameRef.current = nextName;
+      setDisplayName(nextName);
+      window.localStorage.setItem(NAME_STORAGE_KEY, nextName);
+      publishProfileBurst();
+    },
+    [publishProfileBurst]
   );
 
   const refreshDevices = useCallback(async () => {
@@ -980,11 +1359,15 @@ export function MeetApp() {
         roomCode: roomCodeRef.current
       };
 
-      broadcast(message);
+      if (transportRef.current === "local") {
+        sendLocalSignal(message);
+      } else {
+        broadcast(message);
+      }
       setMessages((current) => [...current, { ...message, local: true }]);
       setChatText("");
     },
-    [broadcast, chatText]
+    [broadcast, chatText, sendLocalSignal]
   );
 
   const leaveRoom = useCallback(() => {
@@ -1140,7 +1523,7 @@ export function MeetApp() {
                   className="input"
                   value={displayName}
                   maxLength={34}
-                  onChange={(event) => setDisplayName(event.target.value)}
+                  onChange={(event) => updateDisplayName(event.target.value)}
                 />
               </div>
               <div className="field">

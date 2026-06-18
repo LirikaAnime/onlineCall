@@ -9,6 +9,8 @@
     "build": "next build",
     "preview": "bun run scripts/preview.ts",
     "start": "bun run preview",
+    "tunnel": "HOST=0.0.0.0 bun run scripts/preview.ts",
+    "tailscale": "HOST=0.0.0.0 bun run scripts/preview.ts",
     "typecheck": "tsc --noEmit",
     "audit": "bun audit",
     "check": "bun run typecheck && bun run build",
