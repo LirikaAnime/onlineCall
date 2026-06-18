@@ -2,13 +2,13 @@
   "name": "online-call",
   "version": "0.1.0",
   "private": true,
-  "description": "Static GitHub Pages WebRTC calling app with room codes, chat and screen sharing.",
+  "description": "Local WebRTC calling app with built-in Bun WebSocket signaling.",
   "packageManager": "bun@1.3.14",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "preview": "bun run scripts/preview.ts",
-    "start": "bun run preview",
+    "start": "HOST=0.0.0.0 bun run scripts/preview.ts",
     "tunnel": "HOST=0.0.0.0 bun run scripts/preview.ts",
     "tailscale": "HOST=0.0.0.0 bun run scripts/preview.ts",
     "typecheck": "tsc --noEmit",
@@ -25,7 +25,6 @@
   "dependencies": {
     "lucide-react": "^0.468.0",
     "next": "latest",
-    "peerjs": "^1.5.5",
     "react": "latest",
     "react-dom": "latest"
   },

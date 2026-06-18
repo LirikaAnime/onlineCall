@@ -69,7 +69,9 @@ function leaveRoom(socket: SignalSocket) {
   if (!roomCode || !peer) return;
 
   const room = rooms.get(roomCode);
-  room?.delete(peer.peerId);
+  if (room?.get(peer.peerId) === socket) {
+    room.delete(peer.peerId);
+  }
   if (room?.size === 0) {
     rooms.delete(roomCode);
   }
@@ -82,6 +84,14 @@ function leaveRoom(socket: SignalSocket) {
 
   socket.data.roomCode = undefined;
   socket.data.peer = undefined;
+}
+
+function replaceExistingSocket(roomCode: string, peerId: string, nextSocket: SignalSocket) {
+  const room = rooms.get(roomCode);
+  const existing = room?.get(peerId);
+  if (existing && existing !== nextSocket) {
+    existing.close(1000, "Replaced by a newer connection");
+  }
 }
 
 async function existingFile(pathname: string) {
@@ -183,9 +193,11 @@ function serve(candidatePort: number) {
             rooms.set(roomCode, room);
           }
 
+          replaceExistingSocket(roomCode, peer.peerId, socket);
+
           const existingPeers = Array.from(room.values())
             .map((entry) => entry.data.peer)
-            .filter(Boolean) as RoomPeer[];
+            .filter((entryPeer) => entryPeer && entryPeer.peerId !== peer.peerId) as RoomPeer[];
 
           socket.data.roomCode = roomCode;
           socket.data.peer = peer;
@@ -240,12 +252,22 @@ function serve(candidatePort: number) {
           broadcast(
             roomCode,
             {
-              type: "peer-joined",
+              type: "peer-updated",
               roomCode,
               peer: updatedPeer
             },
             updatedPeer.peerId
           );
+          return;
+        }
+
+        if (message.type === "ping") {
+          send(socket, { type: "pong", time: Date.now() });
+          return;
+        }
+
+        if (message.type === "leave") {
+          leaveRoom(socket);
           return;
         }
 

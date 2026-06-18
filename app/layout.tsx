@@ -1,11 +1,9 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
-const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
-
 export const metadata: Metadata = {
   title: "OnlineCall",
-  description: "WebRTC-созвоны на GitHub Pages: короткий код комнаты, чат, экран и необязательные камера с микрофоном.",
+  description: "Локальные WebRTC-созвоны: свой signaling, короткий код комнаты, чат, экран и необязательные камера с микрофоном.",
   applicationName: "OnlineCall",
   authors: [{ name: "OnlineCall" }],
   appleWebApp: {
@@ -29,9 +27,9 @@ export default function RootLayout({
   return (
     <html lang="ru">
       <head>
-        <link rel="manifest" href={`${basePath}/manifest.webmanifest`} />
-        <link rel="icon" href={`${basePath}/favicon.svg`} />
-        <link rel="apple-touch-icon" href={`${basePath}/icon.svg`} />
+        <link rel="manifest" href="/manifest.webmanifest" />
+        <link rel="icon" href="/favicon.svg" />
+        <link rel="apple-touch-icon" href="/icon.svg" />
       </head>
       <body>{children}</body>
     </html>

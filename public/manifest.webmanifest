@@ -1,12 +1,12 @@
 {
   "name": "OnlineCall",
   "short_name": "OnlineCall",
-  "description": "Static WebRTC calls with short room codes for GitHub Pages.",
+  "description": "Local WebRTC calls with built-in signaling and short room codes.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",
-  "background_color": "#eef2ef",
-  "theme_color": "#10201d",
+  "background_color": "#eef1f4",
+  "theme_color": "#101820",
   "icons": [
     {
       "src": "icon.svg",

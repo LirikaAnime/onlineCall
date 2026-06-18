@@ -4,6 +4,7 @@ import {
   Camera,
   CameraOff,
   Check,
+  Clipboard,
   Copy,
   Link,
   Loader2,
@@ -12,19 +13,18 @@ import {
   MicOff,
   MonitorUp,
   PhoneOff,
-  Plus,
   RefreshCw,
   ScreenShareOff,
   Send,
   Settings2,
   ShieldCheck,
+  Sparkles,
   UserRound,
   UsersRound,
   Video,
   Wifi,
   WifiOff
 } from "lucide-react";
-import type { DataConnection, MediaConnection, Peer } from "peerjs";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   attachLocalMedia,
@@ -37,15 +37,18 @@ import {
 
 type Role = "host" | "guest";
 type Status = "booting" | "connecting" | "ready" | "reconnecting" | "error";
-type Transport = "local" | "peerjs";
 
-type Participant = {
+type RoomPeer = {
   peerId: string;
   participantId: string;
   name: string;
   role: Role;
+};
+
+type Participant = RoomPeer & {
   connected: boolean;
   remoteStream: MediaStream | null;
+  connectionState: RTCPeerConnectionState | "new";
 };
 
 type ChatMessage = {
@@ -62,107 +65,33 @@ type DeviceLists = {
   videoInputs: MediaDeviceInfo[];
 };
 
-type RoomPeer = {
-  peerId: string;
-  participantId: string;
-  name: string;
-  role: Role;
-};
+type SignalPayload =
+  | { kind: "description"; description: RTCSessionDescriptionInit }
+  | { kind: "candidate"; candidate: RTCIceCandidateInit };
 
-type WireMessage =
-  | {
-      type: "hello";
-      peer: RoomPeer;
-      roomCode: string;
-    }
-  | {
-      type: "roster";
-      peers: RoomPeer[];
-      roomCode: string;
-    }
-  | {
-      type: "peer-joined";
-      peer: RoomPeer;
-      roomCode: string;
-    }
-  | {
-      type: "peer-left";
-      peerId: string;
-      roomCode: string;
-    }
-  | {
-      type: "chat";
-      id: string;
-      author: string;
-      text: string;
-      time: number;
-      roomCode: string;
-    };
+type ServerMessage =
+  | { type: "joined"; roomCode: string; peers: RoomPeer[] }
+  | { type: "peer-joined"; roomCode: string; peer: RoomPeer }
+  | { type: "peer-updated"; roomCode: string; peer: RoomPeer }
+  | { type: "peer-left"; roomCode: string; peerId: string }
+  | { type: "signal"; roomCode: string; fromPeerId: string; peer: RoomPeer; signal: SignalPayload }
+  | { type: "chat"; id: string; author: string; text: string; time: number; roomCode: string }
+  | { type: "pong"; time: number }
+  | { type: "error"; message: string };
 
-type LocalSignalMessage =
-  | {
-      type: "joined";
-      roomCode: string;
-      peers: RoomPeer[];
-    }
-  | {
-      type: "peer-joined";
-      roomCode: string;
-      peer: RoomPeer;
-    }
-  | {
-      type: "peer-left";
-      roomCode: string;
-      peerId: string;
-    }
-  | {
-      type: "signal";
-      roomCode: string;
-      fromPeerId: string;
-      peer: RoomPeer;
-      signal:
-        | { kind: "description"; description: RTCSessionDescriptionInit }
-        | { kind: "candidate"; candidate: RTCIceCandidateInit };
-    }
-  | {
-      type: "chat";
-      id: string;
-      author: string;
-      text: string;
-      time: number;
-      roomCode: string;
-    };
-
-type LocalPeerRuntime = {
+type PeerRuntime = {
   connection: RTCPeerConnection;
   wiring: PeerWiring;
+  polite: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
 };
 
-const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const ROOM_PARAM = "room";
-const HOST_STORAGE_KEY = "online-call-host-room";
 const NAME_STORAGE_KEY = "online-call-name";
-const SIGNALING_WATCHDOG_MS = 25_000;
+const RECONNECT_DELAY_MS = 1400;
 
-const peerOptions = {
-  host: "0.peerjs.com",
-  port: 443,
-  path: "/",
-  secure: true,
-  debug: 1,
-  pingInterval: 5000,
-  config: {
-    iceCandidatePoolSize: 4,
-    iceServers: [
-      { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:stun2.l.google.com:19302" },
-      { urls: "stun:global.stun.twilio.com:3478" }
-    ]
-  }
-};
-
-function createId(length = 8) {
+function createId(length = 10) {
   const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
   const bytes = new Uint8Array(length);
   crypto.getRandomValues(bytes);
@@ -181,14 +110,6 @@ function sanitizeRoomCode(value: string) {
     .slice(0, 16);
 }
 
-function hostPeerId(roomCode: string) {
-  return `onlinecall-${roomCode}-host`;
-}
-
-function guestPeerId(roomCode: string, participantId: string, nonce: string) {
-  return `onlinecall-${roomCode}-${participantId}-${nonce}`;
-}
-
 function formatTime(value: number) {
   return new Intl.DateTimeFormat("ru", {
     hour: "2-digit",
@@ -196,10 +117,8 @@ function formatTime(value: number) {
   }).format(value);
 }
 
-function statusText(status: Status, role: Role) {
-  if (status === "ready") {
-    return role === "host" ? "комната открыта" : "подключено";
-  }
+function statusText(status: Status) {
+  if (status === "ready") return "локальная комната открыта";
   if (status === "connecting") return "подключение";
   if (status === "reconnecting") return "переподключение";
   if (status === "error") return "ошибка";
@@ -226,13 +145,13 @@ function VideoElement({
 
 export function MeetApp() {
   const [participantId] = useState(() => createId(8));
+  const [peerId] = useState(() => `oc-${createId(14)}`);
   const [displayName, setDisplayName] = useState("Гость");
   const [roomCode, setRoomCode] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [role, setRole] = useState<Role>("host");
   const [status, setStatus] = useState<Status>("booting");
-  const [statusDetail, setStatusDetail] = useState("Подготовка комнаты");
-  const [selfPeerId, setSelfPeerId] = useState("");
+  const [statusDetail, setStatusDetail] = useState("Готовим локальный сервер");
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
@@ -247,26 +166,15 @@ export function MeetApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [toast, setToast] = useState("");
 
-  const transportRef = useRef<Transport | null>(null);
-  const peerRef = useRef<Peer | null>(null);
-  const localSocketRef = useRef<WebSocket | null>(null);
-  const localPeersRef = useRef(new Map<string, LocalPeerRuntime>());
-  const connectionsRef = useRef(new Map<string, DataConnection>());
-  const mediaCallsRef = useRef(new Map<string, MediaConnection>());
-  const participantsRef = useRef(participants);
+  const socketRef = useRef<WebSocket | null>(null);
+  const peersRef = useRef(new Map<string, PeerRuntime>());
   const localStreamRef = useRef(localStream);
   const screenStreamRef = useRef(screenStream);
   const roomCodeRef = useRef(roomCode);
   const roleRef = useRef(role);
-  const selfPeerIdRef = useRef(selfPeerId);
   const displayNameRef = useRef(displayName);
   const reconnectTimerRef = useRef<number | null>(null);
-  const openWatchdogTimerRef = useRef<number | null>(null);
-  const retryTimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    participantsRef.current = participants;
-  }, [participants]);
+  const heartbeatTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     localStreamRef.current = localStream;
@@ -285,16 +193,12 @@ export function MeetApp() {
   }, [role]);
 
   useEffect(() => {
-    selfPeerIdRef.current = selfPeerId;
-  }, [selfPeerId]);
-
-  useEffect(() => {
     displayNameRef.current = displayName;
   }, [displayName]);
 
-  const connectedCount = participants.filter((participant) => participant.connected).length;
+  const connectedParticipants = participants.filter((participant) => participant.connected);
+  const activeSendStream = screenStream ?? localStream;
   const hasLocalMedia = Boolean(localStream);
-  const activeLocalStream = screenStream ?? localStream;
 
   const roomLink = useMemo(() => {
     if (typeof window === "undefined" || !roomCode) return "";
@@ -305,17 +209,17 @@ export function MeetApp() {
 
   const selfPeer = useCallback(
     (): RoomPeer => ({
-      peerId: selfPeerIdRef.current,
+      peerId,
       participantId,
       name: displayNameRef.current.trim() || "Гость",
       role: roleRef.current
     }),
-    [participantId]
+    [participantId, peerId]
   );
 
   const showToast = useCallback((text: string) => {
     setToast(text);
-    window.setTimeout(() => setToast(""), 2400);
+    window.setTimeout(() => setToast(""), 2200);
   }, []);
 
   const addSystemMessage = useCallback((text: string) => {
@@ -331,29 +235,45 @@ export function MeetApp() {
     ]);
   }, []);
 
+  const socketUrl = useCallback(() => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}/ws`;
+  }, []);
+
+  const sendSocket = useCallback((message: Record<string, unknown>) => {
+    const socket = socketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message));
+      return true;
+    }
+    return false;
+  }, []);
+
   const updateRoomUrl = useCallback((nextRoomCode: string) => {
     const url = new URL(window.location.href);
     url.searchParams.set(ROOM_PARAM, nextRoomCode);
     window.history.replaceState(null, "", url.toString());
   }, []);
 
-  const setParticipant = useCallback((peer: RoomPeer, patch?: Partial<Participant>) => {
-    if (!peer.peerId || peer.peerId === selfPeerIdRef.current) return;
+  const upsertParticipant = useCallback((peer: RoomPeer, patch?: Partial<Participant>) => {
+    if (!peer.peerId || peer.peerId === peerId) return;
 
     setParticipants((current) => {
-      const existing = current.find((item) => item.peerId === peer.peerId);
+      const existing = current.find((participant) => participant.peerId === peer.peerId);
       if (existing) {
-        return current.map((item) =>
-          item.peerId === peer.peerId
+        return current.map((participant) =>
+          participant.peerId === peer.peerId
             ? {
-                ...item,
-                participantId: peer.participantId || item.participantId,
-                name: peer.name || item.name,
-                role: peer.role || item.role,
-                connected: patch?.connected ?? item.connected,
-                remoteStream: patch?.remoteStream ?? item.remoteStream
+                ...participant,
+                participantId: peer.participantId || participant.participantId,
+                name: peer.name || participant.name,
+                role: peer.role || participant.role,
+                connected: patch?.connected ?? participant.connected,
+                remoteStream:
+                  patch && "remoteStream" in patch ? patch.remoteStream ?? null : participant.remoteStream,
+                connectionState: patch?.connectionState ?? participant.connectionState
               }
-            : item
+            : participant
         );
       }
 
@@ -364,289 +284,236 @@ export function MeetApp() {
           participantId: peer.participantId,
           name: peer.name || "Гость",
           role: peer.role,
-          connected: patch?.connected ?? false,
-          remoteStream: patch?.remoteStream ?? null
+          connected: patch?.connected ?? true,
+          remoteStream: patch?.remoteStream ?? null,
+          connectionState: patch?.connectionState ?? "new"
         }
       ];
     });
-  }, []);
+  }, [peerId]);
 
-  const removeParticipant = useCallback((peerId: string) => {
-    setParticipants((current) => current.filter((participant) => participant.peerId !== peerId));
-  }, []);
-
-  const setRemoteStream = useCallback((peerId: string, stream: MediaStream | null) => {
+  const markParticipant = useCallback((remotePeerId: string, patch: Partial<Participant>) => {
     setParticipants((current) =>
       current.map((participant) =>
-        participant.peerId === peerId ? { ...participant, remoteStream: stream } : participant
+        participant.peerId === remotePeerId ? { ...participant, ...patch } : participant
       )
     );
   }, []);
 
-  const closeMediaCall = useCallback(
-    (peerId: string) => {
-      const call = mediaCallsRef.current.get(peerId);
-      if (call) {
-        call.removeAllListeners();
-        call.close();
-      }
-      mediaCallsRef.current.delete(peerId);
-      setRemoteStream(peerId, null);
-    },
-    [setRemoteStream]
-  );
+  const removeParticipant = useCallback((remotePeerId: string) => {
+    peersRef.current.get(remotePeerId)?.connection.close();
+    peersRef.current.delete(remotePeerId);
+    setParticipants((current) => current.filter((participant) => participant.peerId !== remotePeerId));
+  }, []);
 
-  const closeLocalPeer = useCallback(
-    (peerId: string) => {
-      const runtime = localPeersRef.current.get(peerId);
-      if (runtime) {
-        runtime.connection.close();
-      }
-      localPeersRef.current.delete(peerId);
-      setRemoteStream(peerId, null);
-    },
-    [setRemoteStream]
-  );
-
-  const closeDataConnection = useCallback(
-    (peerId: string) => {
-      const connection = connectionsRef.current.get(peerId);
-      if (connection) {
-        connection.removeAllListeners();
-        connection.close();
-      }
-      connectionsRef.current.delete(peerId);
-      closeMediaCall(peerId);
-      closeLocalPeer(peerId);
-      removeParticipant(peerId);
-    },
-    [closeLocalPeer, closeMediaCall, removeParticipant]
-  );
-
-  const cleanupPeer = useCallback(() => {
-    if (reconnectTimerRef.current) {
-      window.clearInterval(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
-    if (openWatchdogTimerRef.current) {
-      window.clearTimeout(openWatchdogTimerRef.current);
-      openWatchdogTimerRef.current = null;
-    }
-    if (retryTimerRef.current) {
-      window.clearTimeout(retryTimerRef.current);
-      retryTimerRef.current = null;
-    }
-
-    connectionsRef.current.forEach((connection) => {
-      connection.removeAllListeners();
-      connection.close();
-    });
-    connectionsRef.current.clear();
-
-    mediaCallsRef.current.forEach((call) => {
-      call.removeAllListeners();
-      call.close();
-    });
-    mediaCallsRef.current.clear();
-
-    localSocketRef.current?.close();
-    localSocketRef.current = null;
-    localPeersRef.current.forEach((runtime, peerId) => {
-      runtime.connection.close();
-    });
-    localPeersRef.current.clear();
-    transportRef.current = null;
-
-    peerRef.current?.removeAllListeners();
-    peerRef.current?.destroy();
-    peerRef.current = null;
+  const closeAllPeers = useCallback(() => {
+    peersRef.current.forEach((runtime) => runtime.connection.close());
+    peersRef.current.clear();
     setParticipants([]);
   }, []);
 
-  const sendToConnection = useCallback((connection: DataConnection, message: WireMessage) => {
-    if (connection.open) {
-      connection.send(message);
-    }
-  }, []);
-
-  const broadcast = useCallback(
-    (message: WireMessage, exceptPeerId?: string) => {
-      connectionsRef.current.forEach((connection, peerId) => {
-        if (peerId !== exceptPeerId) {
-          sendToConnection(connection, message);
-        }
-      });
-    },
-    [sendToConnection]
-  );
-
-  const wireMediaCall = useCallback(
-    (call: MediaConnection) => {
-      mediaCallsRef.current.set(call.peer, call);
-      call.on("stream", (stream) => {
-        setRemoteStream(call.peer, stream);
-      });
-      call.on("close", () => {
-        mediaCallsRef.current.delete(call.peer);
-        setRemoteStream(call.peer, null);
-      });
-      call.on("error", () => {
-        mediaCallsRef.current.delete(call.peer);
-        setRemoteStream(call.peer, null);
-      });
-    },
-    [setRemoteStream]
-  );
-
-  const activeSendStream = useCallback(() => {
-    return screenStreamRef.current ?? localStreamRef.current;
-  }, []);
-
-  const sendLocalSignal = useCallback((message: Record<string, unknown>) => {
-    const socket = localSocketRef.current;
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify(message));
-    }
-  }, []);
-
-  const updateLocalMediaTracks = useCallback(() => {
-    const stream = activeSendStream();
-    const audioTrack = stream?.getAudioTracks()[0] ?? null;
-    const videoTrack = stream?.getVideoTracks()[0] ?? null;
-
-    localPeersRef.current.forEach((runtime, peerId) => {
-      void replaceSenderTrack(runtime.wiring.audioSender, audioTrack);
-      void replaceSenderTrack(runtime.wiring.videoSender, videoTrack);
-      void runtime.connection
-        .createOffer()
-        .then((description) => runtime.connection.setLocalDescription(description))
-        .then(() => {
-          if (!runtime.connection.localDescription) return;
-          sendLocalSignal({
-            type: "signal",
-            roomCode: roomCodeRef.current,
-            toPeerId: peerId,
-            signal: {
-              kind: "description",
-              description: runtime.connection.localDescription.toJSON()
-            }
-          });
-        });
+  const publishProfile = useCallback(() => {
+    sendSocket({
+      type: "profile",
+      roomCode: roomCodeRef.current,
+      peer: selfPeer()
     });
-  }, [activeSendStream, sendLocalSignal]);
+  }, [selfPeer, sendSocket]);
 
-  const localSignalUrl = useCallback(() => {
-    if (typeof window === "undefined") return null;
-    if (window.location.hostname.endsWith("github.io")) return null;
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${window.location.host}${basePath}/ws`;
-  }, []);
+  const publishProfileBurst = useCallback(() => {
+    publishProfile();
+    window.setTimeout(publishProfile, 250);
+    window.setTimeout(publishProfile, 1000);
+  }, [publishProfile]);
 
-  const createLocalPeerConnection = useCallback(
-    (remotePeer: RoomPeer, shouldOffer: boolean) => {
-      if (!remotePeer.peerId || remotePeer.peerId === selfPeerIdRef.current) return null;
+  const sendSignal = useCallback(
+    (toPeerId: string, signal: SignalPayload) => {
+      sendSocket({
+        type: "signal",
+        roomCode: roomCodeRef.current,
+        toPeerId,
+        signal
+      });
+    },
+    [sendSocket]
+  );
 
-      const existing = localPeersRef.current.get(remotePeer.peerId);
+  const negotiate = useCallback(
+    async (remotePeerId: string, runtime: PeerRuntime) => {
+      if (runtime.connection.signalingState !== "stable") return;
+
+      try {
+        runtime.makingOffer = true;
+        const offer = await runtime.connection.createOffer();
+        await runtime.connection.setLocalDescription(offer);
+        if (runtime.connection.localDescription) {
+          sendSignal(remotePeerId, {
+            kind: "description",
+            description: runtime.connection.localDescription.toJSON()
+          });
+        }
+      } catch {
+        // Another peer can start negotiation at the same time. Perfect negotiation will recover
+        // through the incoming offer/answer path, so this local attempt can be skipped.
+      } finally {
+        runtime.makingOffer = false;
+      }
+    },
+    [sendSignal]
+  );
+
+  const createPeerConnection = useCallback(
+    (remotePeer: RoomPeer) => {
+      const existing = peersRef.current.get(remotePeer.peerId);
       if (existing) {
-        setParticipant(remotePeer, { connected: true });
+        upsertParticipant(remotePeer, { connected: true });
         return existing;
       }
 
       const connection = new RTCPeerConnection(createRtcConfig("public-stun"));
-      const wiring = attachLocalMedia(connection, activeSendStream());
-      const runtime: LocalPeerRuntime = { connection, wiring };
-      localPeersRef.current.set(remotePeer.peerId, runtime);
-      setParticipant(remotePeer, { connected: true });
+      const wiring = attachLocalMedia(connection, activeSendStream);
+      const runtime: PeerRuntime = {
+        connection,
+        wiring,
+        polite: peerId > remotePeer.peerId,
+        makingOffer: false,
+        ignoreOffer: false
+      };
+
+      peersRef.current.set(remotePeer.peerId, runtime);
+      upsertParticipant(remotePeer, { connected: true, connectionState: connection.connectionState });
 
       connection.onicecandidate = (event) => {
         if (!event.candidate) return;
-        sendLocalSignal({
-          type: "signal",
-          roomCode: roomCodeRef.current,
-          toPeerId: remotePeer.peerId,
-          signal: {
-            kind: "candidate",
-            candidate: event.candidate.toJSON()
-          }
+        sendSignal(remotePeer.peerId, {
+          kind: "candidate",
+          candidate: event.candidate.toJSON()
         });
       };
 
       connection.ontrack = (event) => {
         const [stream] = event.streams;
-        setRemoteStream(remotePeer.peerId, stream ?? new MediaStream([event.track]));
+        markParticipant(remotePeer.peerId, {
+          connected: true,
+          remoteStream: stream ?? new MediaStream([event.track])
+        });
       };
 
       connection.onconnectionstatechange = () => {
-        if (connection.connectionState === "connected") {
-          setParticipant(remotePeer, { connected: true });
-          return;
-        }
-
-        if (
-          connection.connectionState === "failed" ||
-          connection.connectionState === "closed" ||
-          connection.connectionState === "disconnected"
-        ) {
-          setParticipants((current) =>
-            current.map((participant) =>
-              participant.peerId === remotePeer.peerId
-                ? { ...participant, connected: false, remoteStream: null }
-                : participant
-            )
-          );
-        }
+        const state = connection.connectionState;
+        markParticipant(remotePeer.peerId, {
+          connected: state === "connected" || state === "connecting" || state === "new",
+          connectionState: state,
+          ...(state === "closed" || state === "failed" ? { remoteStream: null } : {})
+        });
       };
 
-      if (shouldOffer) {
-        void connection
-          .createOffer()
-          .then((description) => connection.setLocalDescription(description))
-          .then(() => {
-            if (!connection.localDescription) return;
-            sendLocalSignal({
-              type: "signal",
-              roomCode: roomCodeRef.current,
-              toPeerId: remotePeer.peerId,
-              signal: {
-                kind: "description",
-                description: connection.localDescription.toJSON()
-              }
-            });
-          });
-      }
+      connection.onnegotiationneeded = () => {
+        void negotiate(remotePeer.peerId, runtime);
+      };
 
       return runtime;
     },
-    [activeSendStream, sendLocalSignal, setParticipant, setRemoteStream]
+    [activeSendStream, markParticipant, negotiate, peerId, sendSignal, upsertParticipant]
   );
 
-  const handleLocalSignalMessage = useCallback(
-    async (message: LocalSignalMessage) => {
-      if (message.roomCode !== roomCodeRef.current) return;
+  const handleSignal = useCallback(
+    async (fromPeerId: string, remotePeer: RoomPeer, signal: SignalPayload) => {
+      const runtime = createPeerConnection(remotePeer);
+
+      try {
+        if (signal.kind === "description") {
+          const offerCollision =
+            signal.description.type === "offer" &&
+            (runtime.makingOffer || runtime.connection.signalingState !== "stable");
+
+          runtime.ignoreOffer = !runtime.polite && offerCollision;
+          if (runtime.ignoreOffer) return;
+
+          await runtime.connection.setRemoteDescription(signal.description);
+          if (signal.description.type === "offer") {
+            const answer = await runtime.connection.createAnswer();
+            await runtime.connection.setLocalDescription(answer);
+            if (runtime.connection.localDescription) {
+              sendSignal(fromPeerId, {
+                kind: "description",
+                description: runtime.connection.localDescription.toJSON()
+              });
+            }
+          }
+          return;
+        }
+
+        if (!runtime.ignoreOffer) {
+          await runtime.connection.addIceCandidate(signal.candidate);
+        }
+      } catch (error) {
+        addSystemMessage(
+          error instanceof Error
+            ? `Ошибка WebRTC с ${remotePeer.name}: ${error.message}`
+            : `Ошибка WebRTC с ${remotePeer.name}.`
+        );
+      }
+    },
+    [addSystemMessage, createPeerConnection, sendSignal]
+  );
+
+  const updateOutgoingTracks = useCallback(() => {
+    const stream = screenStreamRef.current ?? localStreamRef.current;
+    const audioTrack = stream?.getAudioTracks()[0] ?? null;
+    const videoTrack = stream?.getVideoTracks()[0] ?? null;
+
+    peersRef.current.forEach((runtime, remotePeerId) => {
+      void replaceSenderTrack(runtime.wiring.audioSender, audioTrack);
+      void replaceSenderTrack(runtime.wiring.videoSender, videoTrack);
+      void negotiate(remotePeerId, runtime);
+    });
+  }, [negotiate]);
+
+  const handleServerMessage = useCallback(
+    (message: ServerMessage) => {
+      if (message.type === "error") {
+        setStatus("error");
+        setStatusDetail(message.message);
+        return;
+      }
+
+      if ("roomCode" in message && message.roomCode !== roomCodeRef.current) return;
 
       if (message.type === "joined") {
-        transportRef.current = "local";
         setStatus("ready");
         setStatusDetail(roleRef.current === "host" ? "Локальная комната открыта" : "Вы в локальной комнате");
-
+        closeAllPeers();
         for (const peer of message.peers) {
-          setParticipant(peer, { connected: true });
+          upsertParticipant(peer, { connected: true });
+          createPeerConnection(peer);
         }
+        publishProfileBurst();
         return;
       }
 
       if (message.type === "peer-joined") {
-        setParticipant(message.peer, { connected: true });
-        createLocalPeerConnection(message.peer, true);
+        upsertParticipant(message.peer, { connected: true });
+        createPeerConnection(message.peer);
+        publishProfileBurst();
+        return;
+      }
+
+      if (message.type === "peer-updated") {
+        upsertParticipant(message.peer, { connected: true });
         return;
       }
 
       if (message.type === "peer-left") {
-        closeLocalPeer(message.peerId);
         removeParticipant(message.peerId);
         return;
       }
 
+      if (message.type === "signal") {
+        void handleSignal(message.fromPeerId, message.peer, message.signal);
+        return;
+      }
+
       if (message.type === "chat") {
         setMessages((current) => {
           if (current.some((item) => item.id === message.id)) return current;
@@ -660,507 +527,105 @@ export function MeetApp() {
             }
           ];
         });
-        return;
       }
-
-      if (message.type !== "signal") return;
-
-      const runtime =
-        localPeersRef.current.get(message.fromPeerId) ??
-        createLocalPeerConnection(message.peer, false);
-      if (!runtime) return;
-
-      if (message.signal.kind === "description") {
-        await runtime.connection.setRemoteDescription(message.signal.description);
-        if (message.signal.description.type === "offer") {
-          const answer = await runtime.connection.createAnswer();
-          await runtime.connection.setLocalDescription(answer);
-          if (runtime.connection.localDescription) {
-            sendLocalSignal({
-              type: "signal",
-              roomCode: roomCodeRef.current,
-              toPeerId: message.fromPeerId,
-              signal: {
-                kind: "description",
-                description: runtime.connection.localDescription.toJSON()
-              }
-            });
-          }
-        }
-        return;
-      }
-
-      await runtime.connection.addIceCandidate(message.signal.candidate);
     },
-    [closeLocalPeer, createLocalPeerConnection, removeParticipant, sendLocalSignal, setParticipant]
+    [
+      closeAllPeers,
+      createPeerConnection,
+      handleSignal,
+      publishProfileBurst,
+      removeParticipant,
+      upsertParticipant
+    ]
   );
 
-  const startLocalSignaling = useCallback(
-    (nextRoomCode: string) => {
-      const url = localSignalUrl();
-      if (!url) return Promise.resolve(false);
+  const joinRoom = useCallback(
+    (nextRoomCode: string, nextRole: Role) => {
+      const cleanRoom = sanitizeRoomCode(nextRoomCode) || createRoomCode();
+      roomCodeRef.current = cleanRoom;
+      roleRef.current = nextRole;
+      setRoomCode(cleanRoom);
+      setRole(nextRole);
+      setJoinCode("");
+      updateRoomUrl(cleanRoom);
 
-      return new Promise<boolean>((resolve) => {
-        let settled = false;
-        const socket = new WebSocket(url);
-        const timeout = window.setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          socket.close();
-          resolve(false);
-        }, 1400);
-
-        socket.onopen = () => {
-          if (settled) return;
-          settled = true;
-          window.clearTimeout(timeout);
-          localSocketRef.current = socket;
-          transportRef.current = "local";
-          setStatus("ready");
-          setStatusDetail(roleRef.current === "host" ? "Локальная комната открыта" : "Локальный signaling готов");
-          socket.send(
-            JSON.stringify({
-              type: "join",
-              roomCode: nextRoomCode,
-              peer: selfPeer()
-            })
-          );
-          resolve(true);
-        };
-
-        socket.onmessage = (event) => {
-          try {
-            void handleLocalSignalMessage(JSON.parse(event.data) as LocalSignalMessage);
-          } catch {
-            addSystemMessage("Локальный signaling прислал некорректное сообщение.");
-          }
-        };
-
-        socket.onclose = () => {
-          if (localSocketRef.current === socket) {
-            localSocketRef.current = null;
-          }
-
-          if (transportRef.current === "local") {
-            setStatus("reconnecting");
-            setStatusDetail("Локальный signaling отключился. Нажмите Повтор или перезапустите сервер.");
-          }
-        };
-
-        socket.onerror = () => {
-          if (settled) return;
-          settled = true;
-          window.clearTimeout(timeout);
-          socket.close();
-          resolve(false);
-        };
+      const connected = sendSocket({
+        type: "join",
+        roomCode: cleanRoom,
+        peer: selfPeer()
       });
-    },
-    [addSystemMessage, handleLocalSignalMessage, localSignalUrl, selfPeer]
-  );
 
-  const callPeer = useCallback(
-    (peerId: string) => {
-      if (transportRef.current === "local") return;
-
-      const peer = peerRef.current;
-      const stream = activeSendStream();
-      if (!peer || !stream || !stream.getTracks().length || peerId === selfPeerIdRef.current) {
-        return;
+      if (!connected) {
+        setStatus("connecting");
+        setStatusDetail("Ждем локальный signaling");
       }
-
-      closeMediaCall(peerId);
-      const call = peer.call(peerId, stream, {
-        metadata: {
-          roomCode: roomCodeRef.current,
-          peer: selfPeer()
-        }
-      });
-      wireMediaCall(call);
     },
-    [activeSendStream, closeMediaCall, selfPeer, wireMediaCall]
+    [selfPeer, sendSocket, updateRoomUrl]
   );
 
-  const callAllPeers = useCallback(() => {
-    if (transportRef.current === "local") {
-      updateLocalMediaTracks();
+  const connectSocket = useCallback(() => {
+    if (socketRef.current?.readyState === WebSocket.OPEN || socketRef.current?.readyState === WebSocket.CONNECTING) {
       return;
     }
 
-    connectionsRef.current.forEach((connection, peerId) => {
-      if (connection.open) callPeer(peerId);
-    });
-  }, [callPeer, updateLocalMediaTracks]);
+    setStatus((current) => (current === "booting" ? "connecting" : "reconnecting"));
+    setStatusDetail("Подключаемся к локальному signaling");
 
-  const handleWireMessage = useCallback(
-    (fromPeerId: string, message: WireMessage) => {
-      if (message.roomCode !== roomCodeRef.current) return;
+    const socket = new WebSocket(socketUrl());
+    socketRef.current = socket;
 
-      if (message.type === "hello") {
-        setParticipant(message.peer, { connected: true });
-
-        if (roleRef.current === "host") {
-          const roster = [
-            selfPeer(),
-            ...participantsRef.current.map((participant) => ({
-              peerId: participant.peerId,
-              participantId: participant.participantId,
-              name: participant.name,
-              role: participant.role
-            }))
-          ];
-          const connection = connectionsRef.current.get(fromPeerId);
-          if (connection) {
-            sendToConnection(connection, {
-              type: "roster",
-              peers: roster,
-              roomCode: roomCodeRef.current
-            });
-          }
-          broadcast(
-            {
-              type: "peer-joined",
-              peer: message.peer,
-              roomCode: roomCodeRef.current
-            },
-            fromPeerId
-          );
-        }
-        return;
+    socket.onopen = () => {
+      setStatus("ready");
+      setStatusDetail("Signaling подключен");
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
       }
+      joinRoom(roomCodeRef.current || createRoomCode(), roleRef.current);
+      heartbeatTimerRef.current = window.setInterval(() => {
+        sendSocket({ type: "ping", time: Date.now() });
+      }, 15000);
+    };
 
-      if (message.type === "roster") {
-        for (const peer of message.peers) {
-          if (peer.peerId !== selfPeerIdRef.current) {
-            setParticipant(peer, { connected: true });
-            connectToPeer(peer.peerId);
-          }
-        }
-        return;
+    socket.onmessage = (event) => {
+      try {
+        handleServerMessage(JSON.parse(event.data) as ServerMessage);
+      } catch {
+        addSystemMessage("Signaling прислал некорректное сообщение.");
       }
+    };
 
-      if (message.type === "peer-joined") {
-        setParticipant(message.peer, { connected: true });
-        connectToPeer(message.peer.peerId);
-        return;
+    socket.onclose = () => {
+      if (socketRef.current === socket) {
+        socketRef.current = null;
       }
-
-      if (message.type === "peer-left") {
-        closeDataConnection(message.peerId);
-        return;
+      if (heartbeatTimerRef.current) {
+        window.clearInterval(heartbeatTimerRef.current);
+        heartbeatTimerRef.current = null;
       }
+      closeAllPeers();
+      setStatus("reconnecting");
+      setStatusDetail("Signaling отключился, пробуем снова");
+      reconnectTimerRef.current = window.setTimeout(connectSocket, RECONNECT_DELAY_MS);
+    };
 
-      if (message.type === "chat") {
-        setMessages((current) => {
-          if (current.some((item) => item.id === message.id)) return current;
-          return [
-            ...current,
-            {
-              id: message.id,
-              author: message.author,
-              text: message.text,
-              time: message.time
-            }
-          ];
-        });
-      }
-    },
-    [broadcast, closeDataConnection, selfPeer, sendToConnection, setParticipant]
-  );
-
-  const wireDataConnection = useCallback(
-    (connection: DataConnection) => {
-      if (connection.peer === selfPeerIdRef.current) return;
-
-      const existing = connectionsRef.current.get(connection.peer);
-      if (existing && existing.open) {
-        connection.close();
-        return;
-      }
-
-      connectionsRef.current.set(connection.peer, connection);
-
-      connection.on("open", () => {
-        setStatus("ready");
-        setStatusDetail(roleRef.current === "host" ? "Комната открыта" : "Вы в комнате");
-
-        const remotePeer = connection.metadata?.peer as RoomPeer | undefined;
-        if (remotePeer) {
-          setParticipant(remotePeer, { connected: true });
-        }
-
-        sendToConnection(connection, {
-          type: "hello",
-          peer: selfPeer(),
-          roomCode: roomCodeRef.current
-        });
-
-        if (activeSendStream()?.getTracks().length) {
-          callPeer(connection.peer);
-        }
-      });
-
-      connection.on("data", (data) => {
-        handleWireMessage(connection.peer, data as WireMessage);
-      });
-
-      connection.on("close", () => {
-        connectionsRef.current.delete(connection.peer);
-        closeMediaCall(connection.peer);
-        setParticipants((current) =>
-          current.map((participant) =>
-            participant.peerId === connection.peer
-              ? { ...participant, connected: false, remoteStream: null }
-              : participant
-          )
-        );
-      });
-
-      connection.on("error", () => {
-        connectionsRef.current.delete(connection.peer);
-        closeMediaCall(connection.peer);
-      });
-    },
-    [
-      activeSendStream,
-      callPeer,
-      closeMediaCall,
-      handleWireMessage,
-      selfPeer,
-      sendToConnection,
-      setParticipant
-    ]
-  );
-
-  const connectToPeer = useCallback(
-    (targetPeerId: string) => {
-      const peer = peerRef.current;
-      if (!peer || !peer.open || targetPeerId === selfPeerIdRef.current) return;
-
-      const existing = connectionsRef.current.get(targetPeerId);
-      if (existing?.open) return;
-
-      const connection = peer.connect(targetPeerId, {
-        reliable: true,
-        serialization: "json",
-        metadata: {
-          roomCode: roomCodeRef.current,
-          peer: selfPeer()
-        }
-      });
-      wireDataConnection(connection);
-    },
-    [selfPeer, wireDataConnection]
-  );
-
-  const connectToHost = useCallback(() => {
-    if (roleRef.current !== "guest" || !roomCodeRef.current) return;
-
-    const targetHostId = hostPeerId(roomCodeRef.current);
-    if (connectionsRef.current.get(targetHostId)?.open) return;
-
-    setStatus("connecting");
-    setStatusDetail("Ищем ведущего комнаты");
-    connectToPeer(targetHostId);
-  }, [connectToPeer]);
-
-  const createPeerInstance = useCallback(
-    async (nextRoomCode: string, nextRole: Role, attempt = 0) => {
-      cleanupPeer();
-
-      const nextPeerId =
-        nextRole === "host"
-          ? hostPeerId(nextRoomCode)
-          : guestPeerId(nextRoomCode, participantId, createId(4));
-
-      setRoomCode(nextRoomCode);
-      setRole(nextRole);
-      setSelfPeerId(nextPeerId);
-      setStatus("connecting");
-      setStatusDetail(nextRole === "host" ? "Открываем комнату" : "Подключаемся к комнате");
-      roomCodeRef.current = nextRoomCode;
-      roleRef.current = nextRole;
-      selfPeerIdRef.current = nextPeerId;
-
-      if (await startLocalSignaling(nextRoomCode)) {
-        return;
-      }
-
-      transportRef.current = "peerjs";
-      const { Peer } = await import("peerjs");
-      const peer = new Peer(nextPeerId, peerOptions);
-      peerRef.current = peer;
-
-      const scheduleRetry = (detail: string, delayMs = Math.min(1800 + attempt * 900, 8000)) => {
-        const cleanDetail = detail.replace(/[.\s]+$/g, "");
-        if (peerRef.current === peer) {
-          peer.removeAllListeners();
-          peer.destroy();
-          peerRef.current = null;
-        }
-
-        if (openWatchdogTimerRef.current) {
-          window.clearTimeout(openWatchdogTimerRef.current);
-          openWatchdogTimerRef.current = null;
-        }
-        if (retryTimerRef.current) {
-          window.clearTimeout(retryTimerRef.current);
-        }
-
-        const nextAttempt = attempt + 1;
-        setStatus("reconnecting");
-        setStatusDetail(`${cleanDetail}. Повтор ${nextAttempt + 1}`);
-        retryTimerRef.current = window.setTimeout(() => {
-          retryTimerRef.current = null;
-          if (roomCodeRef.current !== nextRoomCode || roleRef.current !== nextRole) return;
-          void createPeerInstance(nextRoomCode, nextRole, nextAttempt);
-        }, delayMs);
-      };
-
-      openWatchdogTimerRef.current = window.setTimeout(() => {
-        if (peerRef.current !== peer || peer.open || peer.destroyed) return;
-
-        scheduleRetry(`Signaling не ответил за ${Math.round(SIGNALING_WATCHDOG_MS / 1000)} секунд`);
-      }, SIGNALING_WATCHDOG_MS);
-
-      peer.on("open", () => {
-        if (openWatchdogTimerRef.current) {
-          window.clearTimeout(openWatchdogTimerRef.current);
-          openWatchdogTimerRef.current = null;
-        }
-
-        setStatus("ready");
-        setStatusDetail(nextRole === "host" ? "Комната открыта" : "Готово, ищем ведущего");
-
-        if (nextRole === "guest") {
-          connectToHost();
-          reconnectTimerRef.current = window.setInterval(connectToHost, 2500);
-        }
-      });
-
-      peer.on("connection", (connection) => {
-        const metadataRoom = connection.metadata?.roomCode as string | undefined;
-        if (metadataRoom && metadataRoom !== roomCodeRef.current) {
-          connection.close();
-          return;
-        }
-        wireDataConnection(connection);
-      });
-
-      peer.on("call", (call) => {
-        const metadataRoom = call.metadata?.roomCode as string | undefined;
-        if (metadataRoom && metadataRoom !== roomCodeRef.current) {
-          call.close();
-          return;
-        }
-
-        const remotePeer = call.metadata?.peer as RoomPeer | undefined;
-        if (remotePeer) {
-          setParticipant(remotePeer, { connected: true });
-        }
-        call.answer(activeSendStream() ?? new MediaStream());
-        wireMediaCall(call);
-      });
-
-      peer.on("disconnected", () => {
-        setStatus("reconnecting");
-        setStatusDetail("Потеряна связь с signaling, переподключаемся");
-        if (!peer.destroyed) {
-          try {
-            peer.reconnect();
-          } catch {
-            scheduleRetry("Не удалось переподключиться к signaling");
-          }
-        }
-      });
-
-      peer.on("error", (error) => {
-        if (openWatchdogTimerRef.current) {
-          window.clearTimeout(openWatchdogTimerRef.current);
-          openWatchdogTimerRef.current = null;
-        }
-
-        if (error.type === "peer-unavailable" && roleRef.current === "guest") {
-          setStatus("reconnecting");
-          setStatusDetail("Ведущий еще не в комнате, повторяем подключение");
-          return;
-        }
-
-        if (error.type === "unavailable-id" && nextRole === "host") {
-          const replacementRoomCode = createRoomCode();
-          window.sessionStorage.setItem(HOST_STORAGE_KEY, replacementRoomCode);
-          updateRoomUrl(replacementRoomCode);
-          addSystemMessage(
-            `Комната ${nextRoomCode} еще занята на signaling. Создана новая комната ${replacementRoomCode}.`
-          );
-          void createPeerInstance(replacementRoomCode, "host", 0);
-          return;
-        }
-
-        if (error.type === "unavailable-id" && nextRole === "guest") {
-          scheduleRetry("ID участника занят, переподключаемся", 600);
-          return;
-        }
-
-        if (
-          error.type === "network" ||
-          error.type === "server-error" ||
-          error.type === "socket-error" ||
-          error.type === "socket-closed"
-        ) {
-          scheduleRetry("Публичный signaling недоступен");
-          return;
-        }
-
-        setStatus("error");
-        setStatusDetail(error.message || "Ошибка signaling");
-      });
-    },
-    [
-      addSystemMessage,
-      activeSendStream,
-      cleanupPeer,
-      connectToHost,
-      participantId,
-      setParticipant,
-      startLocalSignaling,
-      updateRoomUrl,
-      wireDataConnection,
-      wireMediaCall
-    ]
-  );
-
-  const startRoom = useCallback(
-    (nextRoomCode: string, nextRole: Role) => {
-      const cleanRoom = sanitizeRoomCode(nextRoomCode) || createRoomCode();
-      if (nextRole === "host") {
-        window.sessionStorage.setItem(HOST_STORAGE_KEY, cleanRoom);
-      } else if (window.sessionStorage.getItem(HOST_STORAGE_KEY) !== cleanRoom) {
-        window.sessionStorage.removeItem(HOST_STORAGE_KEY);
-      }
-      setJoinCode("");
-      updateRoomUrl(cleanRoom);
-      void createPeerInstance(cleanRoom, nextRole);
-    },
-    [createPeerInstance, updateRoomUrl]
-  );
+    socket.onerror = () => {
+      setStatus("reconnecting");
+      setStatusDetail("Локальный signaling недоступен");
+    };
+  }, [addSystemMessage, closeAllPeers, handleServerMessage, joinRoom, sendSocket, socketUrl]);
 
   const createNewRoom = useCallback(() => {
     const nextRoomCode = createRoomCode();
     addSystemMessage(`Создана новая комната ${nextRoomCode}.`);
-    startRoom(nextRoomCode, "host");
-  }, [addSystemMessage, startRoom]);
+    joinRoom(nextRoomCode, "host");
+  }, [addSystemMessage, joinRoom]);
 
   const retryCurrentRoom = useCallback(() => {
-    const currentRoomCode = roomCodeRef.current || sanitizeRoomCode(roomCode);
-    if (!currentRoomCode) {
-      createNewRoom();
-      return;
-    }
-
-    addSystemMessage(`Повторяем подключение к комнате ${currentRoomCode}.`);
-    void createPeerInstance(currentRoomCode, roleRef.current, 0);
-  }, [addSystemMessage, createNewRoom, createPeerInstance, roomCode]);
+    closeAllPeers();
+    connectSocket();
+    joinRoom(roomCodeRef.current || roomCode || createRoomCode(), roleRef.current);
+  }, [closeAllPeers, connectSocket, joinRoom, roomCode]);
 
   const joinCurrentRoom = useCallback(() => {
     const cleanJoinCode = sanitizeRoomCode(joinCode);
@@ -1168,14 +633,8 @@ export function MeetApp() {
       showToast("Введите код комнаты");
       return;
     }
-
-    if (roleRef.current === "host" && cleanJoinCode === roomCodeRef.current) {
-      showToast("Вы уже ведущий этой комнаты");
-      return;
-    }
-
-    startRoom(cleanJoinCode, "guest");
-  }, [joinCode, showToast, startRoom]);
+    joinRoom(cleanJoinCode, "guest");
+  }, [joinCode, joinRoom, showToast]);
 
   const copyText = useCallback(
     async (text: string, message = "Скопировано") => {
@@ -1183,44 +642,6 @@ export function MeetApp() {
       showToast(message);
     },
     [showToast]
-  );
-
-  const publishProfile = useCallback(() => {
-    if (!selfPeerIdRef.current || !roomCodeRef.current) return;
-
-    if (transportRef.current === "local") {
-      sendLocalSignal({
-        type: "profile",
-        roomCode: roomCodeRef.current,
-        peer: selfPeer()
-      });
-      return;
-    }
-
-    if (transportRef.current === "peerjs") {
-      broadcast({
-        type: "peer-joined",
-        peer: selfPeer(),
-        roomCode: roomCodeRef.current
-      });
-    }
-  }, [broadcast, selfPeer, sendLocalSignal]);
-
-  const publishProfileBurst = useCallback(() => {
-    publishProfile();
-    window.setTimeout(publishProfile, 250);
-    window.setTimeout(publishProfile, 1000);
-    window.setTimeout(publishProfile, 2500);
-  }, [publishProfile]);
-
-  const updateDisplayName = useCallback(
-    (nextName: string) => {
-      displayNameRef.current = nextName;
-      setDisplayName(nextName);
-      window.localStorage.setItem(NAME_STORAGE_KEY, nextName);
-      publishProfileBurst();
-    },
-    [publishProfileBurst]
   );
 
   const refreshDevices = useCallback(async () => {
@@ -1238,15 +659,8 @@ export function MeetApp() {
       const constraints: MediaStreamConstraints = {
         audio: audioDeviceId ? { deviceId: { exact: audioDeviceId } } : true,
         video: videoDeviceId
-          ? {
-              deviceId: { exact: videoDeviceId },
-              width: { ideal: 1280 },
-              height: { ideal: 720 }
-            }
-          : {
-              width: { ideal: 1280 },
-              height: { ideal: 720 }
-            }
+          ? { deviceId: { exact: videoDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          : { width: { ideal: 1280 }, height: { ideal: 720 } }
       };
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       stream.getAudioTracks().forEach((track) => {
@@ -1257,14 +671,13 @@ export function MeetApp() {
       });
 
       const previous = localStreamRef.current;
+      localStreamRef.current = stream;
       setLocalStream(stream);
       setPreviewStream(screenStreamRef.current ?? stream);
-      localStreamRef.current = stream;
-      await refreshDevices();
-
       if (previous && previous !== stream) stopStream(previous);
-      callAllPeers();
-      showToast("Камера и микрофон готовы.");
+      await refreshDevices();
+      updateOutgoingTracks();
+      showToast("Камера и микрофон готовы");
     } catch (error) {
       addSystemMessage(
         error instanceof Error
@@ -1275,11 +688,11 @@ export function MeetApp() {
   }, [
     addSystemMessage,
     audioDeviceId,
-    callAllPeers,
     cameraEnabled,
     micEnabled,
     refreshDevices,
     showToast,
+    updateOutgoingTracks,
     videoDeviceId
   ]);
 
@@ -1305,16 +718,13 @@ export function MeetApp() {
 
   const stopScreenShare = useCallback(() => {
     stopStream(screenStreamRef.current);
-    setScreenStream(null);
     screenStreamRef.current = null;
+    setScreenStream(null);
     setPreviewStream(localStreamRef.current);
     setIsSharingScreen(false);
-
-    mediaCallsRef.current.forEach((call) => call.close());
-    mediaCallsRef.current.clear();
-    if (localStreamRef.current) callAllPeers();
-    showToast("Демонстрация экрана остановлена.");
-  }, [callAllPeers, showToast]);
+    updateOutgoingTracks();
+    showToast("Демонстрация экрана остановлена");
+  }, [showToast, updateOutgoingTracks]);
 
   const startScreenShare = useCallback(async () => {
     try {
@@ -1322,19 +732,16 @@ export function MeetApp() {
         video: { frameRate: { ideal: 30 } },
         audio: false
       });
-      const screenTrack = stream.getVideoTracks()[0];
-      if (!screenTrack) throw new Error("Браузер не вернул видеодорожку экрана.");
+      const track = stream.getVideoTracks()[0];
+      if (!track) throw new Error("Браузер не вернул видеодорожку экрана.");
 
-      screenTrack.onended = stopScreenShare;
-      setScreenStream(stream);
+      track.onended = stopScreenShare;
       screenStreamRef.current = stream;
+      setScreenStream(stream);
       setPreviewStream(stream);
       setIsSharingScreen(true);
-
-      mediaCallsRef.current.forEach((call) => call.close());
-      mediaCallsRef.current.clear();
-      callAllPeers();
-      showToast("Демонстрация экрана включена.");
+      updateOutgoingTracks();
+      showToast("Демонстрация экрана включена");
     } catch (error) {
       addSystemMessage(
         error instanceof Error
@@ -1342,7 +749,7 @@ export function MeetApp() {
           : "Не удалось включить демонстрацию экрана."
       );
     }
-  }, [addSystemMessage, callAllPeers, showToast, stopScreenShare]);
+  }, [addSystemMessage, showToast, stopScreenShare, updateOutgoingTracks]);
 
   const sendChat = useCallback(
     (event: FormEvent) => {
@@ -1350,41 +757,47 @@ export function MeetApp() {
       const text = chatText.trim();
       if (!text) return;
 
-      const message: WireMessage = {
-        type: "chat",
+      const message: ChatMessage = {
         id: createId(),
         author: displayNameRef.current.trim() || "Гость",
         text,
         time: Date.now(),
-        roomCode: roomCodeRef.current
+        local: true
       };
 
-      if (transportRef.current === "local") {
-        sendLocalSignal(message);
-      } else {
-        broadcast(message);
-      }
-      setMessages((current) => [...current, { ...message, local: true }]);
+      sendSocket({
+        type: "chat",
+        id: message.id,
+        author: message.author,
+        text: message.text,
+        time: message.time,
+        roomCode: roomCodeRef.current
+      });
+      setMessages((current) => [...current, message]);
       setChatText("");
     },
-    [broadcast, chatText, sendLocalSignal]
+    [chatText, sendSocket]
   );
 
   const leaveRoom = useCallback(() => {
-    broadcast({
-      type: "peer-left",
-      peerId: selfPeerIdRef.current,
-      roomCode: roomCodeRef.current
-    });
-    cleanupPeer();
+    sendSocket({ type: "leave", roomCode: roomCodeRef.current });
+    closeAllPeers();
     setStatus("booting");
     setStatusDetail("Комната закрыта локально");
-  }, [broadcast, cleanupPeer]);
+  }, [closeAllPeers, sendSocket]);
+
+  const updateDisplayName = useCallback(
+    (nextName: string) => {
+      displayNameRef.current = nextName;
+      setDisplayName(nextName);
+      window.localStorage.setItem(NAME_STORAGE_KEY, nextName);
+      publishProfileBurst();
+    },
+    [publishProfileBurst]
+  );
 
   useEffect(() => {
-    addSystemMessage(
-      "Комната подключается автоматически. Камера и микрофон не обязательны: можно войти только для чата."
-    );
+    addSystemMessage("Локальный режим: сайт и signaling работают с вашего ПК. Камера и микрофон не обязательны.");
 
     const savedName = window.localStorage.getItem(NAME_STORAGE_KEY);
     if (savedName) {
@@ -1394,44 +807,26 @@ export function MeetApp() {
 
     const params = new URLSearchParams(window.location.search);
     const codeFromUrl = sanitizeRoomCode(params.get(ROOM_PARAM) ?? "");
-    const ownedRoom = window.sessionStorage.getItem(HOST_STORAGE_KEY);
-
-    if (codeFromUrl) {
-      setRoomCode(codeFromUrl);
-      const nextRole: Role = ownedRoom === codeFromUrl ? "host" : "guest";
-      void createPeerInstance(codeFromUrl, nextRole);
-    } else {
-      const nextRoomCode = createRoomCode();
-      window.sessionStorage.setItem(HOST_STORAGE_KEY, nextRoomCode);
-      updateRoomUrl(nextRoomCode);
-      setRoomCode(nextRoomCode);
-      void createPeerInstance(nextRoomCode, "host");
-    }
+    const initialRoom = codeFromUrl || createRoomCode();
+    const initialRole: Role = codeFromUrl ? "guest" : "host";
+    roomCodeRef.current = initialRoom;
+    roleRef.current = initialRole;
+    setRoomCode(initialRoom);
+    setRole(initialRole);
+    updateRoomUrl(initialRoom);
 
     void refreshDevices();
-
-    if ("serviceWorker" in navigator) {
-      window.addEventListener("load", () => {
-        navigator.serviceWorker.register(`${basePath}/sw.js`).catch(() => undefined);
-      });
-    }
-
-    const onBeforeUnload = () => {
-      broadcast({
-        type: "peer-left",
-        peerId: selfPeerIdRef.current,
-        roomCode: roomCodeRef.current
-      });
-    };
-    window.addEventListener("beforeunload", onBeforeUnload);
+    connectSocket();
 
     return () => {
-      window.removeEventListener("beforeunload", onBeforeUnload);
-      cleanupPeer();
+      if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
+      if (heartbeatTimerRef.current) window.clearInterval(heartbeatTimerRef.current);
+      socketRef.current?.close();
+      closeAllPeers();
       stopStream(screenStreamRef.current);
       stopStream(localStreamRef.current);
     };
-  }, [addSystemMessage, broadcast, cleanupPeer, createPeerInstance, refreshDevices, updateRoomUrl]);
+  }, [addSystemMessage, closeAllPeers, connectSocket, refreshDevices, updateRoomUrl]);
 
   useEffect(() => {
     window.localStorage.setItem(NAME_STORAGE_KEY, displayName);
@@ -1439,225 +834,194 @@ export function MeetApp() {
 
   return (
     <main className="app-shell">
+      <header className="app-topbar">
+        <div className="brand-lockup">
+          <div className="brand-mark" aria-hidden="true">
+            <Video size={24} />
+          </div>
+          <div>
+            <h1>OnlineCall</h1>
+            <p>Локальная комната для звонков через ваш ПК</p>
+          </div>
+        </div>
+        <div className={`connection-banner ${status}`}>
+          {status === "ready" ? <Check size={17} /> : status === "error" ? <WifiOff size={17} /> : <Loader2 size={17} className="spin" />}
+          <span>
+            {statusText(status)}: {statusDetail}
+          </span>
+        </div>
+      </header>
+
       <div className="workspace">
         <aside className="sidebar">
-          <div className="panel">
-            <section className="section">
-              <div className="brand">
-                <div className="brand-mark" aria-hidden="true">
-                  <Video size={24} />
-                </div>
-                <div>
-                  <h1 className="brand-title">OnlineCall</h1>
-                  <p className="brand-subtitle">Комната по короткому коду</p>
-                </div>
-              </div>
-            </section>
+          <section className="panel room-panel">
+            <div className="section-title">
+              <h2>Комната</h2>
+              {status === "ready" ? <Wifi size={18} /> : <WifiOff size={18} />}
+            </div>
+            <div className="room-code">{roomCode || "------"}</div>
+            <div className="button-row">
+              <button className="btn btn-secondary" type="button" onClick={createNewRoom}>
+                <Sparkles size={17} />
+                Новая
+              </button>
+              <button
+                className="btn btn-secondary"
+                type="button"
+                disabled={!roomLink}
+                onClick={() => copyText(roomLink, "Ссылка скопирована")}
+              >
+                <Link size={17} />
+                Ссылка
+              </button>
+              <button
+                className="btn btn-secondary"
+                type="button"
+                disabled={!roomCode}
+                onClick={() => copyText(roomCode, "Код скопирован")}
+              >
+                <Copy size={17} />
+                Код
+              </button>
+              <button className="btn btn-secondary" type="button" onClick={retryCurrentRoom}>
+                <RefreshCw size={17} />
+                Повтор
+              </button>
+            </div>
+          </section>
 
-            <section className="section">
-              <div className="section-title">
-                <h2>Комната</h2>
-                {status === "ready" ? <Wifi size={18} /> : <WifiOff size={18} />}
-              </div>
-              <div className="room-code">{roomCode || "------"}</div>
-              <div className="button-row">
-                <button className="btn btn-secondary" type="button" onClick={createNewRoom}>
-                  <Plus size={17} />
-                  Новая
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  type="button"
-                  disabled={!roomLink}
-                  onClick={() => copyText(roomLink, "Ссылка комнаты скопирована")}
-                >
-                  <Link size={17} />
-                  Ссылка
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  type="button"
-                  disabled={!roomCode}
-                  onClick={() => copyText(roomCode, "Код комнаты скопирован")}
-                >
-                  <Copy size={17} />
-                  Код
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  type="button"
-                  disabled={!roomCode}
-                  onClick={retryCurrentRoom}
-                >
-                  <RefreshCw size={17} />
-                  Повтор
-                </button>
-              </div>
-              <div className={`connection-banner ${status}`}>
-                {status === "connecting" || status === "reconnecting" || status === "booting" ? (
-                  <Loader2 size={16} className="spin" />
-                ) : status === "ready" ? (
-                  <Check size={16} />
-                ) : (
-                  <WifiOff size={16} />
-                )}
-                <span>
-                  {statusText(status, role)}: {statusDetail}
-                </span>
-              </div>
-              <p className="helper">
-                Подключение автоматическое. Дайте человеку ссылку или код комнаты, ручной обмен
-                техническими кодами больше не нужен.
-              </p>
-            </section>
-
-            <section className="section">
-              <div className="section-title">
-                <h2>Профиль</h2>
-                <ShieldCheck size={18} aria-hidden="true" />
-              </div>
-              <div className="field">
-                <label htmlFor="displayName">Ваше имя</label>
+          <section className="panel">
+            <div className="section-title">
+              <h2>Профиль</h2>
+              <ShieldCheck size={18} />
+            </div>
+            <div className="field">
+              <label htmlFor="displayName">Ваше имя</label>
+              <input
+                id="displayName"
+                className="input"
+                value={displayName}
+                maxLength={34}
+                onChange={(event) => updateDisplayName(event.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="roomInput">Войти по коду</label>
+              <div className="copy-row">
                 <input
-                  id="displayName"
+                  id="roomInput"
                   className="input"
-                  value={displayName}
-                  maxLength={34}
-                  onChange={(event) => updateDisplayName(event.target.value)}
+                  value={joinCode}
+                  placeholder="например k4p9xq"
+                  onChange={(event) => setJoinCode(sanitizeRoomCode(event.target.value))}
                 />
+                <button
+                  className="btn btn-primary"
+                  type="button"
+                  disabled={!sanitizeRoomCode(joinCode)}
+                  onClick={joinCurrentRoom}
+                >
+                  Войти
+                </button>
               </div>
-              <div className="field">
-                <label htmlFor="roomInput">Войти по коду</label>
-                <div className="copy-row">
-                  <input
-                    id="roomInput"
-                    className="input"
-                    value={joinCode}
-                    placeholder="например abc123"
-                    onChange={(event) => setJoinCode(sanitizeRoomCode(event.target.value))}
-                  />
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={!sanitizeRoomCode(joinCode)}
-                    onClick={joinCurrentRoom}
-                  >
-                    Войти
-                  </button>
-                </div>
-              </div>
-            </section>
+            </div>
+          </section>
 
-            <section className="section">
-              <div className="section-title">
-                <h2>Устройства</h2>
-                <Settings2 size={18} aria-hidden="true" />
-              </div>
-              <div className="field">
-                <label htmlFor="audioDevice">Микрофон</label>
-                <select
-                  id="audioDevice"
-                  className="select"
-                  value={audioDeviceId}
-                  onChange={(event) => setAudioDeviceId(event.target.value)}
-                >
-                  {devices.audioInputs.length === 0 ? (
-                    <option value="">По умолчанию</option>
-                  ) : (
-                    devices.audioInputs.map((device, index) => (
-                      <option key={device.deviceId || index} value={device.deviceId}>
-                        {device.label || `Микрофон ${index + 1}`}
-                      </option>
-                    ))
-                  )}
-                </select>
-              </div>
-              <div className="field">
-                <label htmlFor="videoDevice">Камера</label>
-                <select
-                  id="videoDevice"
-                  className="select"
-                  value={videoDeviceId}
-                  onChange={(event) => setVideoDeviceId(event.target.value)}
-                >
-                  {devices.videoInputs.length === 0 ? (
-                    <option value="">По умолчанию</option>
-                  ) : (
-                    devices.videoInputs.map((device, index) => (
-                      <option key={device.deviceId || index} value={device.deviceId}>
-                        {device.label || `Камера ${index + 1}`}
-                      </option>
-                    ))
-                  )}
-                </select>
-              </div>
-              <div className="button-row">
-                <button className="btn btn-primary" type="button" onClick={startLocalMedia}>
-                  <Camera size={17} />
-                  {hasLocalMedia ? "Перезапустить медиа" : "Включить медиа"}
-                </button>
-                <button className="btn btn-secondary" type="button" onClick={refreshDevices}>
-                  <RefreshCw size={17} />
-                  Обновить
-                </button>
-              </div>
-              <p className="helper">Без камеры и микрофона комната тоже работает: чат и просмотр доступны.</p>
-            </section>
-          </div>
+          <section className="panel">
+            <div className="section-title">
+              <h2>Устройства</h2>
+              <Settings2 size={18} />
+            </div>
+            <div className="field">
+              <label htmlFor="audioDevice">Микрофон</label>
+              <select
+                id="audioDevice"
+                className="select"
+                value={audioDeviceId}
+                onChange={(event) => setAudioDeviceId(event.target.value)}
+              >
+                {devices.audioInputs.length === 0 ? (
+                  <option value="">По умолчанию</option>
+                ) : (
+                  devices.audioInputs.map((device, index) => (
+                    <option key={device.deviceId || index} value={device.deviceId}>
+                      {device.label || `Микрофон ${index + 1}`}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="videoDevice">Камера</label>
+              <select
+                id="videoDevice"
+                className="select"
+                value={videoDeviceId}
+                onChange={(event) => setVideoDeviceId(event.target.value)}
+              >
+                {devices.videoInputs.length === 0 ? (
+                  <option value="">По умолчанию</option>
+                ) : (
+                  devices.videoInputs.map((device, index) => (
+                    <option key={device.deviceId || index} value={device.deviceId}>
+                      {device.label || `Камера ${index + 1}`}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+            <div className="button-row">
+              <button className="btn btn-primary" type="button" onClick={startLocalMedia}>
+                <Camera size={17} />
+                {hasLocalMedia ? "Перезапустить медиа" : "Включить медиа"}
+              </button>
+              <button className="btn btn-secondary" type="button" onClick={refreshDevices}>
+                <RefreshCw size={17} />
+                Обновить
+              </button>
+            </div>
+          </section>
         </aside>
 
         <section className="stage panel">
-          <header className="topbar">
-            <div className="room-title">
-              <h1>Комната {roomCode}</h1>
+          <div className="stage-header">
+            <div>
+              <h2>Комната {roomCode}</h2>
               <p>
-                {connectedCount} подключено, роль: {role === "host" ? "ведущий" : "участник"}
+                {connectedParticipants.length} подключено, роль: {role === "host" ? "ведущий" : "участник"}
               </p>
             </div>
             <div className="status-pill">
               <span className={`dot ${status === "ready" ? "ready" : ""}`} />
-              {statusText(status, role)}
+              {statusText(status)}
             </div>
-          </header>
+          </div>
 
           <div className="video-grid">
-            <div className="video-tile">
-              {previewStream ? (
-                <VideoElement stream={previewStream} muted />
-              ) : (
-                <div className="video-placeholder">
-                  <div>
-                    <CameraOff size={34} />
-                    <div>Вы без локального видео</div>
-                  </div>
-                </div>
-              )}
-              <div className="tile-badge">
-                <UserRound size={15} />
-                <span>{displayName || "Вы"}</span>
-              </div>
-            </div>
-
+            <VideoTile
+              label={displayName || "Вы"}
+              subtitle="вы"
+              stream={previewStream}
+              muted
+              emptyIcon={<CameraOff size={34} />}
+              emptyText="Вы без локального видео"
+            />
             {participants
               .filter((participant) => participant.remoteStream)
               .map((participant) => (
-                <div className="video-tile" key={participant.peerId}>
-                  <VideoElement stream={participant.remoteStream} />
-                  <div className="tile-badge">
-                    <UsersRound size={15} />
-                    <span>{participant.name}</span>
-                  </div>
-                </div>
+                <VideoTile
+                  key={participant.peerId}
+                  label={participant.name}
+                  subtitle={participant.connectionState}
+                  stream={participant.remoteStream}
+                  emptyIcon={<UsersRound size={34} />}
+                  emptyText="Ожидаем видео"
+                />
               ))}
-
             {!participants.some((participant) => participant.remoteStream) && (
-              <div className="video-tile">
-                <div className="video-placeholder">
-                  <div>
-                    <UsersRound size={34} />
-                    <div>Видео участников появится, когда они включат камеру или экран</div>
-                  </div>
-                </div>
+              <div className="video-tile video-tile-muted">
+                <UsersRound size={38} />
+                <div>Видео участников появится после включения камеры или экрана</div>
               </div>
             )}
           </div>
@@ -1695,7 +1059,7 @@ export function MeetApp() {
               </button>
             </div>
             <div className="status-line">
-              Видео: {getTrackLabel(localStream?.getVideoTracks()[0])}
+              Видео: {getTrackLabel(activeSendStream?.getVideoTracks()[0])}
               <br />
               Аудио: {getTrackLabel(localStream?.getAudioTracks()[0])}
             </div>
@@ -1703,75 +1067,69 @@ export function MeetApp() {
         </section>
 
         <aside className="side-panel">
-          <div className="panel">
-            <section className="section">
-              <div className="section-title">
-                <h2>Участники</h2>
-                <UsersRound size={18} aria-hidden="true" />
-              </div>
-              <div className="peer-list">
-                <ParticipantRow
-                  name={`${displayName || "Вы"} (вы)`}
-                  role={role}
-                  connected={status === "ready"}
-                />
-                {participants.length ? (
-                  participants.map((participant) => (
-                    <ParticipantRow
-                      key={participant.peerId}
-                      name={participant.name}
-                      role={participant.role}
-                      connected={participant.connected}
-                    />
-                  ))
-                ) : (
-                  <div className="empty-state">
-                    <div>
-                      <UsersRound size={30} />
-                      <div>Пока никого нет</div>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </section>
-          </div>
+          <section className="panel participants-panel">
+            <div className="section-title">
+              <h2>Участники</h2>
+              <UsersRound size={18} />
+            </div>
+            <div className="participant-list">
+              <ParticipantRow
+                name={`${displayName || "Вы"} (вы)`}
+                role={role}
+                connected={status === "ready"}
+                state="local"
+              />
+              {participants.length ? (
+                participants.map((participant) => (
+                  <ParticipantRow
+                    key={participant.peerId}
+                    name={participant.name}
+                    role={participant.role}
+                    connected={participant.connected}
+                    state={participant.connectionState}
+                  />
+                ))
+              ) : (
+                <div className="empty-state">
+                  <UsersRound size={30} />
+                  <div>Пока никого нет</div>
+                </div>
+              )}
+            </div>
+          </section>
 
-          <div className="panel">
-            <section className="section">
-              <div className="section-title">
-                <h2>Чат</h2>
-                <MessageSquareText size={18} aria-hidden="true" />
-              </div>
-              <div className="chat-log" aria-live="polite">
-                {messages.map((message) => (
-                  <div
-                    key={message.id}
-                    className={`message ${message.local ? "local" : ""} ${
-                      message.system ? "system" : ""
-                    }`}
-                  >
-                    <div className="message-meta">
-                      <span>{message.author}</span>
-                      <span className="message-time">{formatTime(message.time)}</span>
-                    </div>
-                    <div className="message-text">{message.text}</div>
+          <section className="panel chat-panel">
+            <div className="section-title">
+              <h2>Чат</h2>
+              <MessageSquareText size={18} />
+            </div>
+            <div className="chat-log" aria-live="polite">
+              {messages.map((message) => (
+                <div
+                  key={message.id}
+                  className={`message ${message.local ? "local" : ""} ${message.system ? "system" : ""}`}
+                >
+                  <div className="message-meta">
+                    <span>{message.author}</span>
+                    <span>{formatTime(message.time)}</span>
                   </div>
-                ))}
-              </div>
-              <form className="chat-form" onSubmit={sendChat}>
-                <input
-                  className="input"
-                  value={chatText}
-                  onChange={(event) => setChatText(event.target.value)}
-                  placeholder="Сообщение в чат"
-                />
-                <button className="btn btn-primary" type="submit" disabled={!chatText.trim()}>
-                  <Send size={17} />
-                  Отправить
-                </button>
-              </form>
-            </section>
-          </div>
+                  <div className="message-text">{message.text}</div>
+                </div>
+              ))}
+            </div>
+            <form className="chat-form" onSubmit={sendChat}>
+              <input
+                className="input"
+                value={chatText}
+                onChange={(event) => setChatText(event.target.value)}
+                placeholder="Сообщение в чат"
+              />
+              <button className="btn btn-primary" type="submit" disabled={!chatText.trim()}>
+                <Send size={17} />
+                Отправить
+              </button>
+            </form>
+          </section>
         </aside>
       </div>
       {toast ? <div className="toast">{toast}</div> : null}
@@ -1779,20 +1137,59 @@ export function MeetApp() {
   );
 }
 
+function VideoTile({
+  label,
+  subtitle,
+  stream,
+  muted,
+  emptyIcon,
+  emptyText
+}: {
+  label: string;
+  subtitle: string;
+  stream: MediaStream | null;
+  muted?: boolean;
+  emptyIcon: React.ReactNode;
+  emptyText: string;
+}) {
+  return (
+    <div className="video-tile">
+      {stream ? (
+        <VideoElement stream={stream} muted={muted} />
+      ) : (
+        <div className="video-placeholder">
+          {emptyIcon}
+          <div>{emptyText}</div>
+        </div>
+      )}
+      <div className="tile-badge">
+        <UserRound size={15} />
+        <span>{label}</span>
+        <small>{subtitle}</small>
+      </div>
+    </div>
+  );
+}
+
 function ParticipantRow({
   name,
   role,
-  connected
+  connected,
+  state
 }: {
   name: string;
   role: Role;
   connected: boolean;
+  state: string;
 }) {
   return (
     <div className="participant-row">
-      <div className="peer-name">
+      <div className="participant-avatar">
+        <UserRound size={17} />
+      </div>
+      <div className="participant-meta">
         <strong>{name}</strong>
-        <span className="status-text">{role === "host" ? "ведущий" : "участник"}</span>
+        <span>{role === "host" ? "ведущий" : "участник"} · {state}</span>
       </div>
       <span className={`badge ${connected ? "connected" : "waiting"}`}>
         {connected ? "онлайн" : "ожидание"}
