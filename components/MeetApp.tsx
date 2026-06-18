@@ -95,6 +95,25 @@ const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const ROOM_PARAM = "room";
 const HOST_STORAGE_KEY = "online-call-host-room";
 const NAME_STORAGE_KEY = "online-call-name";
+const SIGNALING_WATCHDOG_MS = 25_000;
+
+const peerOptions = {
+  host: "0.peerjs.com",
+  port: 443,
+  path: "/",
+  secure: true,
+  debug: 1,
+  pingInterval: 5000,
+  config: {
+    iceCandidatePoolSize: 4,
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:global.stun.twilio.com:3478" }
+    ]
+  }
+};
 
 function createId(length = 8) {
   const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -193,6 +212,7 @@ export function MeetApp() {
   const displayNameRef = useRef(displayName);
   const reconnectTimerRef = useRef<number | null>(null);
   const openWatchdogTimerRef = useRef<number | null>(null);
+  const retryTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     participantsRef.current = participants;
@@ -348,6 +368,10 @@ export function MeetApp() {
     if (openWatchdogTimerRef.current) {
       window.clearTimeout(openWatchdogTimerRef.current);
       openWatchdogTimerRef.current = null;
+    }
+    if (retryTimerRef.current) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
     }
 
     connectionsRef.current.forEach((connection) => {
@@ -624,29 +648,40 @@ export function MeetApp() {
       roleRef.current = nextRole;
       selfPeerIdRef.current = nextPeerId;
 
-      const peer = new Peer(nextPeerId, {
-        debug: 1,
-        pingInterval: 5000
-      });
+      const peer = new Peer(nextPeerId, peerOptions);
       peerRef.current = peer;
+
+      const scheduleRetry = (detail: string, delayMs = Math.min(1800 + attempt * 900, 8000)) => {
+        const cleanDetail = detail.replace(/[.\s]+$/g, "");
+        if (peerRef.current === peer) {
+          peer.removeAllListeners();
+          peer.destroy();
+          peerRef.current = null;
+        }
+
+        if (openWatchdogTimerRef.current) {
+          window.clearTimeout(openWatchdogTimerRef.current);
+          openWatchdogTimerRef.current = null;
+        }
+        if (retryTimerRef.current) {
+          window.clearTimeout(retryTimerRef.current);
+        }
+
+        const nextAttempt = attempt + 1;
+        setStatus("reconnecting");
+        setStatusDetail(`${cleanDetail}. Повтор ${nextAttempt + 1}`);
+        retryTimerRef.current = window.setTimeout(() => {
+          retryTimerRef.current = null;
+          if (roomCodeRef.current !== nextRoomCode || roleRef.current !== nextRole) return;
+          void createPeerInstance(nextRoomCode, nextRole, nextAttempt);
+        }, delayMs);
+      };
 
       openWatchdogTimerRef.current = window.setTimeout(() => {
         if (peerRef.current !== peer || peer.open || peer.destroyed) return;
 
-        peer.removeAllListeners();
-        peer.destroy();
-        peerRef.current = null;
-
-        if (attempt >= 3) {
-          setStatus("error");
-          setStatusDetail("Signaling не ответил. Попробуйте обновить страницу или создать новую комнату.");
-          return;
-        }
-
-        setStatus("reconnecting");
-        setStatusDetail("Signaling не ответил, повторяем подключение");
-        void createPeerInstance(nextRoomCode, nextRole, attempt + 1);
-      }, 10_000);
+        scheduleRetry(`Signaling не ответил за ${Math.round(SIGNALING_WATCHDOG_MS / 1000)} секунд`);
+      }, SIGNALING_WATCHDOG_MS);
 
       peer.on("open", () => {
         if (openWatchdogTimerRef.current) {
@@ -694,8 +729,7 @@ export function MeetApp() {
           try {
             peer.reconnect();
           } catch {
-            setStatus("error");
-            setStatusDetail("Не удалось переподключиться к signaling");
+            scheduleRetry("Не удалось переподключиться к signaling");
           }
         }
       });
@@ -713,15 +747,28 @@ export function MeetApp() {
         }
 
         if (error.type === "unavailable-id" && nextRole === "host") {
-          setStatus("error");
-          setStatusDetail("Эта комната уже открыта в другой вкладке. Откройте новую комнату.");
+          const replacementRoomCode = createRoomCode();
+          window.sessionStorage.setItem(HOST_STORAGE_KEY, replacementRoomCode);
+          updateRoomUrl(replacementRoomCode);
+          addSystemMessage(
+            `Комната ${nextRoomCode} еще занята на signaling. Создана новая комната ${replacementRoomCode}.`
+          );
+          void createPeerInstance(replacementRoomCode, "host", 0);
           return;
         }
 
-        if (error.type === "unavailable-id" && nextRole === "guest" && attempt < 3) {
-          setStatus("reconnecting");
-          setStatusDetail("ID участника занят, переподключаемся");
-          void createPeerInstance(nextRoomCode, nextRole, attempt + 1);
+        if (error.type === "unavailable-id" && nextRole === "guest") {
+          scheduleRetry("ID участника занят, переподключаемся", 600);
+          return;
+        }
+
+        if (
+          error.type === "network" ||
+          error.type === "server-error" ||
+          error.type === "socket-error" ||
+          error.type === "socket-closed"
+        ) {
+          scheduleRetry("Публичный signaling недоступен");
           return;
         }
 
@@ -730,11 +777,13 @@ export function MeetApp() {
       });
     },
     [
+      addSystemMessage,
       activeSendStream,
       cleanupPeer,
       connectToHost,
       participantId,
       setParticipant,
+      updateRoomUrl,
       wireDataConnection,
       wireMediaCall
     ]
@@ -760,6 +809,17 @@ export function MeetApp() {
     addSystemMessage(`Создана новая комната ${nextRoomCode}.`);
     startRoom(nextRoomCode, "host");
   }, [addSystemMessage, startRoom]);
+
+  const retryCurrentRoom = useCallback(() => {
+    const currentRoomCode = roomCodeRef.current || sanitizeRoomCode(roomCode);
+    if (!currentRoomCode) {
+      createNewRoom();
+      return;
+    }
+
+    addSystemMessage(`Повторяем подключение к комнате ${currentRoomCode}.`);
+    void createPeerInstance(currentRoomCode, roleRef.current, 0);
+  }, [addSystemMessage, createNewRoom, createPeerInstance, roomCode]);
 
   const joinCurrentRoom = useCallback(() => {
     const cleanJoinCode = sanitizeRoomCode(joinCode);
@@ -1039,6 +1099,15 @@ export function MeetApp() {
                 >
                   <Copy size={17} />
                   Код
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  type="button"
+                  disabled={!roomCode}
+                  onClick={retryCurrentRoom}
+                >
+                  <RefreshCw size={17} />
+                  Повтор
                 </button>
               </div>
               <div className={`connection-banner ${status}`}>

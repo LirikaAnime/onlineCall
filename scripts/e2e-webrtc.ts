@@ -146,10 +146,11 @@ async function main() {
 
   const meaningfulConsoleErrors = consoleErrors.filter((error) => {
     const knownPeerJsWebSocketNoise =
-      error.includes("0.peerjs.com/peerjs") &&
-      (error.includes("was interrupted") ||
-        error.includes("can’t establish a connection") ||
-        error.includes("can't establish a connection"));
+      (error.includes("0.peerjs.com/peerjs") &&
+        (error.includes("was interrupted") ||
+          error.includes("can’t establish a connection") ||
+          error.includes("can't establish a connection"))) ||
+      (error.includes("PeerJS") && error.includes("Lost connection to server"));
 
     return !error.includes("Critical dependency") && !knownPeerJsWebSocketNoise;
   });
